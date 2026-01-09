@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  response2chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: response2chat
+    ports:
+      - "8000:8000"
+    environment:
+      - RESPONSE_API_BASE=${RESPONSE_API_BASE}
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEFAULT_TIMEOUT=300
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
