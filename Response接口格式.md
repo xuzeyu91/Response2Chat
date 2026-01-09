@@ -1,17 +1,14 @@
 原生Response格式
 
-```
-curl -X POST "https://api.routin.ai/plan/v1/responses" \
+
+curl -X POST "https://docs.newapi.pro/v1/responses" \
   -H "Authorization: Bearer " \
   -H "Content-Type: application/json" \
   -d '{
     "model": "string"
   }'
 
-```
-
-响应200
-```
+返回
 {
   "id": "string",
   "object": "response",
@@ -49,6 +46,48 @@ curl -X POST "https://api.routin.ai/plan/v1/responses" \
     }
   }
 }
-```
 
-响应400
+
+Authorization
+BearerAuth
+
+Authorization
+Bearer <token>
+使用 Bearer Token 认证。 格式: Authorization: Bearer sk-xxxxxx
+
+In: header
+
+Request Body
+application/json
+
+model*
+string
+input?
+string
+|
+array<object>
+输入内容，可以是字符串或消息数组
+
+instructions?
+string
+max_output_tokens?
+integer
+temperature?
+number
+top_p?
+number
+stream?
+boolean
+tools?
+array<object>
+tool_choice?
+string
+|
+object
+reasoning?
+object
+previous_response_id?
+string
+truncation?
+string
+Value in"auto" | "disabled"
