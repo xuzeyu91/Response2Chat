@@ -569,7 +569,8 @@ async def handle_stream_response(
                     elif line.startswith("data:"):
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
-                            logger.info(f"流式响应完成，输出内容: {processor.accumulated_content}")
+                            final_response = processor.get_accumulated_response()
+                            logger.info(f"流式响应完成: {json.dumps(final_response, ensure_ascii=False)}")
                             # 发送最终 chunks
                             for chunk in processor.get_final_chunks():
                                 yield chunk
@@ -595,7 +596,8 @@ async def handle_stream_response(
                             continue
                 
                 # 如果没有收到 [DONE]，手动发送结束
-                logger.info(f"流结束，输出内容: {processor.accumulated_content}")
+                final_response = processor.get_accumulated_response()
+                logger.info(f"流结束: {json.dumps(final_response, ensure_ascii=False)}")
                 for chunk in processor.get_final_chunks():
                     yield chunk
                     
@@ -697,8 +699,7 @@ async def handle_non_stream_response(
         
         # 返回累积的完整响应
         result = processor.get_accumulated_response()
-        logger.info(f"返回完整响应: content_length={len(result.get('choices', [{}])[0].get('message', {}).get('content', ''))}")
-        logger.debug(f"完整响应: {json.dumps(result, ensure_ascii=False, indent=2)}")
+        logger.info(f"返回完整响应: {json.dumps(result, ensure_ascii=False)}")
         return JSONResponse(content=result)
         
     except httpx.TimeoutException:
