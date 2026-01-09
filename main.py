@@ -658,6 +658,29 @@ async def handle_stream_response(
                         try:
                             event_data = json.loads(data_str)
                             logger.debug(f"解析事件数据: type={event_data.get('type', current_event_type)}")
+                            
+                            # 检查是否为上游错误响应（如账户池无可用）
+                            if "error" in event_data:
+                                error_info = event_data.get("error", {})
+                                error_code = error_info.get("code")
+                                error_message = error_info.get("message", "")
+                                logger.error(f"上游错误响应: {json.dumps(event_data, ensure_ascii=False)}")
+                                
+                                # 检查是否为账户池无可用错误
+                                is_pool_unavailable = (error_code == 503 or 
+                                                       error_code == "503" or 
+                                                       "账户池都无可用" in error_message)
+                                
+                                error_chunk = {
+                                    "error": {
+                                        "message": error_message or f"Upstream error: {data_str}",
+                                        "type": error_info.get("type", "upstream_error"),
+                                        "code": "500" if is_pool_unavailable else str(error_code or "unknown")
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                                return
+                            
                             # 处理事件
                             if current_event_type:
                                 chunks = processor.process_event(current_event_type, event_data)
@@ -776,6 +799,24 @@ async def handle_non_stream_response(
                     try:
                         event_data = json.loads(data_str)
                         logger.debug(f"解析事件数据: type={event_data.get('type', current_event_type)}")
+                        
+                        # 检查是否为上游错误响应（如账户池无可用）
+                        if "error" in event_data:
+                            error_info = event_data.get("error", {})
+                            error_code = error_info.get("code")
+                            error_message = error_info.get("message", "")
+                            logger.error(f"上游错误响应: {json.dumps(event_data, ensure_ascii=False)}")
+                            
+                            # 检查是否为账户池无可用错误
+                            is_pool_unavailable = (error_code == 503 or 
+                                                   error_code == "503" or 
+                                                   "账户池都无可用" in error_message)
+                            
+                            return JSONResponse(
+                                status_code=500 if is_pool_unavailable else 502,
+                                content={"error": error_info}
+                            )
+                        
                         if current_event_type:
                             processor.process_event(current_event_type, event_data)
                         elif "type" in event_data:
