@@ -22,8 +22,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== 日志配置 ====================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("response2chat")
@@ -568,7 +569,7 @@ async def handle_stream_response(
                     elif line.startswith("data:"):
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
-                            logger.info("收到 [DONE] 信号，结束流式响应")
+                            logger.info(f"流式响应完成，输出内容长度: {len(processor.accumulated_content)}")
                             # 发送最终 chunks
                             for chunk in processor.get_final_chunks():
                                 yield chunk
@@ -594,7 +595,7 @@ async def handle_stream_response(
                             continue
                 
                 # 如果没有收到 [DONE]，手动发送结束
-                logger.info("流结束，发送最终 chunks")
+                logger.info(f"流结束，输出内容长度: {len(processor.accumulated_content)}")
                 for chunk in processor.get_final_chunks():
                     yield chunk
                     

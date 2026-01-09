@@ -24,7 +24,8 @@ EXPOSE 8000
 # 设置默认环境变量（可在运行时覆盖）
 ENV HOST=0.0.0.0 \
     PORT=8000 \
-    DEFAULT_TIMEOUT=300
+    DEFAULT_TIMEOUT=300 \
+    LOG_LEVEL=INFO
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

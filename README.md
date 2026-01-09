@@ -74,6 +74,43 @@ Windows 用户也可以直接运行：
 start.bat
 ```
 
+### 4. 使用 Docker 部署
+
+#### 使用 Docker 直接构建
+
+```bash
+# 构建镜像
+docker build -t response2chat .
+
+# 构建镜像（无缓存）
+docker build --no-cache -t response2chat .
+
+# 运行容器
+docker run -d \
+  --name response2chat \
+  -p 8011:8000 \
+  -e RESPONSE_API_BASE=https://api.routin.ai/plan/v1 \
+  -e DEFAULT_TIMEOUT=300 \
+  response2chat
+```
+
+#### 使用 Docker Compose（推荐）
+
+```bash
+# 先配置 .env 文件
+cp .env.example .env
+# 编辑 .env 设置 RESPONSE_API_BASE
+
+# 构建并启动
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 停止服务
+docker-compose down
+```
+
 ## 📖 API 使用
 
 ### Chat Completions
@@ -85,7 +122,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5-pro",
+    "model": "gpt-4",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello!"}
@@ -134,25 +171,29 @@ curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:8000/v1/models
 
 ## ⚙️ 配置说明
 
-| 环境变量 | 必填 | 说明 | 默认值 |
-|----------|------|------|--------|
-| `RESPONSE_API_BASE` | ✅ 是 | Response API 基础 URL | 无（必须配置） |
-| `HOST` | 否 | 服务监听地址 | `0.0.0.0` |
-| `PORT` | 否 | 服务监听端口 | `8000` |
-| `DEFAULT_TIMEOUT` | 否 | 请求超时时间（秒） | `300` |
+
+| 环境变量                | 必填  | 说明                  | 默认值       |
+| ------------------- | --- | ------------------- | --------- |
+| `RESPONSE_API_BASE` | ✅ 是 | Response API 基础 URL | 无（必须配置）   |
+| `HOST`              | 否   | 服务监听地址              | `0.0.0.0` |
+| `PORT`              | 否   | 服务监听端口              | `8000`    |
+| `DEFAULT_TIMEOUT`   | 否   | 请求超时时间（秒）           | `300`     |
+
 
 ## 🔄 参数映射
 
-| Chat API 参数 | Response API 映射 | 说明 |
-|---------------|-------------------|------|
-| `model` | `model` | 模型 ID |
-| `messages` | `input` | 对话消息列表 |
-| `max_tokens` | `max_output_tokens` | 最大生成 Token 数 |
+
+| Chat API 参数             | Response API 映射     | 说明           |
+| ----------------------- | ------------------- | ------------ |
+| `model`                 | `model`             | 模型 ID        |
+| `messages`              | `input`             | 对话消息列表       |
+| `max_tokens`            | `max_output_tokens` | 最大生成 Token 数 |
 | `max_completion_tokens` | `max_output_tokens` | 最大补全 Token 数 |
-| `tools` | `tools` | 工具定义 |
-| `tool_choice` | `tool_choice` | 工具选择 |
-| `reasoning_effort` | `reasoning.effort` | 推理强度 |
-| `response_format` | `text.format` | 响应格式 |
+| `tools`                 | `tools`             | 工具定义         |
+| `tool_choice`           | `tool_choice`       | 工具选择         |
+| `reasoning_effort`      | `reasoning.effort`  | 推理强度         |
+| `response_format`       | `text.format`       | 响应格式         |
+
 
 > 注意：`system` 角色会自动转换为 `developer` 角色（Response API 规范）
 

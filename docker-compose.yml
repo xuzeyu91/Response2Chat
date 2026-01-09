@@ -13,6 +13,7 @@ services:
       - HOST=0.0.0.0
       - PORT=8000
       - DEFAULT_TIMEOUT=300
+      - LOG_LEVEL=INFO
     env_file:
       - .env
     restart: unless-stopped
