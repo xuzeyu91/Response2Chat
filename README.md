@@ -89,7 +89,7 @@ docker build --no-cache -t response2chat .
 docker run -d \
   --name response2chat \
   -p 8011:8000 \
-  -e RESPONSE_API_BASE=https://api.routin.ai/plan/v1 \
+  -e RESPONSE_API_BASE=https://your-response-api.com/v1 \
   -e DEFAULT_TIMEOUT=300 \
   response2chat
 ```

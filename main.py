@@ -569,7 +569,7 @@ async def handle_stream_response(
                     elif line.startswith("data:"):
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
-                            logger.info(f"流式响应完成，输出内容长度: {len(processor.accumulated_content)}")
+                            logger.info(f"流式响应完成，输出内容: {processor.accumulated_content}")
                             # 发送最终 chunks
                             for chunk in processor.get_final_chunks():
                                 yield chunk
@@ -595,7 +595,7 @@ async def handle_stream_response(
                             continue
                 
                 # 如果没有收到 [DONE]，手动发送结束
-                logger.info(f"流结束，输出内容长度: {len(processor.accumulated_content)}")
+                logger.info(f"流结束，输出内容: {processor.accumulated_content}")
                 for chunk in processor.get_final_chunks():
                     yield chunk
                     
