@@ -79,8 +79,69 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: Optional[Dict[str, int]] = None
-    completion_tokens_details: Optional[Dict[str, int]] = None
+    prompt_tokens_details: Optional[Dict[str, Any]] = None
+    completion_tokens_details: Optional[Dict[str, Any]] = None
+
+
+def convert_response_usage_to_chat_usage(response_usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    将 Response API 的 usage 格式转换为 Chat API 的 usage 格式
+    
+    Response API 格式:
+    {
+        "input_tokens": 17254,
+        "input_tokens_details": {"cached_tokens": 7936},
+        "output_tokens": 336,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 17590
+    }
+    
+    Chat API 格式:
+    {
+        "prompt_tokens": 12709,
+        "prompt_tokens_details": {
+            "audio_tokens": 0,
+            "cached_tokens": 12032
+        },
+        "completion_tokens": 322,
+        "completion_tokens_details": {
+            "accepted_prediction_tokens": 0,
+            "audio_tokens": 0,
+            "reasoning_tokens": 0,
+            "rejected_prediction_tokens": 0
+        },
+        "total_tokens": 13031
+    }
+    """
+    if response_usage is None:
+        return None
+    
+    # 基本字段转换: input_tokens -> prompt_tokens, output_tokens -> completion_tokens
+    chat_usage = {
+        "prompt_tokens": response_usage.get("input_tokens", 0),
+        "completion_tokens": response_usage.get("output_tokens", 0),
+        "total_tokens": response_usage.get("total_tokens", 0)
+    }
+    
+    # 转换 input_tokens_details -> prompt_tokens_details
+    input_details = response_usage.get("input_tokens_details")
+    if input_details:
+        chat_usage["prompt_tokens_details"] = {
+            "audio_tokens": input_details.get("audio_tokens", 0),
+            "cached_tokens": input_details.get("cached_tokens", 0)
+        }
+    
+    # 转换 output_tokens_details -> completion_tokens_details
+    output_details = response_usage.get("output_tokens_details")
+    if output_details:
+        chat_usage["completion_tokens_details"] = {
+            "accepted_prediction_tokens": output_details.get("accepted_prediction_tokens", 0),
+            "audio_tokens": output_details.get("audio_tokens", 0),
+            "reasoning_tokens": output_details.get("reasoning_tokens", 0),
+            "rejected_prediction_tokens": output_details.get("rejected_prediction_tokens", 0)
+        }
+    
+    return chat_usage
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -370,12 +431,15 @@ class ResponseStreamProcessor:
         """获取最终的 chunks（完成信号和使用统计）"""
         chunks = []
         
+        # 转换 usage 格式: Response API -> Chat API
+        chat_usage = convert_response_usage_to_chat_usage(self.usage) if self.include_usage else None
+        
         # 发送完成信号
         finish_chunk = create_chat_stream_chunk(
             self.chat_id, self.model,
             {},
             finish_reason="stop",
-            usage=self.usage if self.include_usage else None
+            usage=chat_usage
         )
         chunks.append(finish_chunk)
         chunks.append("data: [DONE]\n\n")
@@ -395,6 +459,9 @@ class ResponseStreamProcessor:
         if self.tool_calls:
             message["tool_calls"] = self.tool_calls
         
+        # 转换 usage 格式: Response API -> Chat API
+        chat_usage = convert_response_usage_to_chat_usage(self.usage)
+        
         return {
             "id": self.chat_id,
             "object": "chat.completion",
@@ -407,7 +474,7 @@ class ResponseStreamProcessor:
                     "finish_reason": "stop" if not self.tool_calls else "tool_calls"
                 }
             ],
-            "usage": self.usage
+            "usage": chat_usage
         }
 
 
