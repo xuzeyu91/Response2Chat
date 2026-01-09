@@ -613,11 +613,23 @@ async def handle_stream_response(
                     error_body = await response.aread()
                     error_msg = error_body.decode("utf-8", errors="ignore")
                     logger.error(f"上游错误响应: {error_msg}")
+                    
+                    # 检查是否为账户池无可用错误，返回 500 状态码
+                    is_pool_unavailable = False
+                    try:
+                        error_json = json.loads(error_msg)
+                        if error_json.get("error", {}).get("code") == 503 or \
+                           "账户池都无可用" in error_json.get("error", {}).get("message", ""):
+                            is_pool_unavailable = True
+                    except:
+                        if "账户池都无可用" in error_msg:
+                            is_pool_unavailable = True
+                    
                     error_chunk = {
                         "error": {
                             "message": f"Upstream error: {error_msg}",
                             "type": "upstream_error",
-                            "code": str(response.status_code)
+                            "code": "500" if is_pool_unavailable else str(response.status_code)
                         }
                     }
                     yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
@@ -727,13 +739,21 @@ async def handle_non_stream_response(
                 error_body = await response.aread()
                 error_text = error_body.decode("utf-8", errors="ignore")
                 logger.error(f"上游错误响应: {error_text}")
+                
+                # 检查是否为账户池无可用错误，返回 500 状态码
+                is_pool_unavailable = False
                 try:
                     error_data = json.loads(error_text)
+                    if error_data.get("error", {}).get("code") == 503 or \
+                       "账户池都无可用" in error_data.get("error", {}).get("message", ""):
+                        is_pool_unavailable = True
                 except:
                     error_data = {"message": error_text}
+                    if "账户池都无可用" in error_text:
+                        is_pool_unavailable = True
                 
                 return JSONResponse(
-                    status_code=response.status_code,
+                    status_code=500 if is_pool_unavailable else response.status_code,
                     content={"error": error_data}
                 )
             
