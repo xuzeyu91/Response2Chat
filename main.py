@@ -157,13 +157,14 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
     }
     
     # 可选参数映射 - 只添加 Response API 支持的参数
-    # 注意：某些 Response API 可能不支持 temperature, top_p 等参数
+    # 注意：某些 Response API 可能不支持 temperature, top_p, max_output_tokens 等参数
     # 根据实际 API 支持情况调整
-    
-    if chat_request.max_tokens is not None:
-        response_request["max_output_tokens"] = chat_request.max_tokens
-    if chat_request.max_completion_tokens is not None:
-        response_request["max_output_tokens"] = chat_request.max_completion_tokens
+    # max_output_tokens 参数已注释，因为某些上游 API (如 api.routin.ai) 不支持此参数
+    # 如需启用，取消以下注释：
+    # if chat_request.max_tokens is not None:
+    #     response_request["max_output_tokens"] = chat_request.max_tokens
+    # if chat_request.max_completion_tokens is not None:
+    #     response_request["max_output_tokens"] = chat_request.max_completion_tokens
     
     # tools 格式转换
     # Chat API 格式: {"type": "function", "function": {"name": "xxx", "description": "xxx", "parameters": {...}}}
