@@ -736,6 +736,7 @@ async def handle_stream_response(
                     # 检查是否为需要返回 500 状态码的错误（让网关触发自动禁用）
                     # 包括：账户池无可用(503)、配额不足(402)
                     should_return_500 = False
+                    error_output = None
                     try:
                         error_json = json.loads(error_msg)
                         error_code = error_json.get("error", {}).get("code")
@@ -745,22 +746,30 @@ async def handle_stream_response(
                            "账户池都无可用" in error_message or \
                            response.status_code == 402:
                             should_return_500 = True
+                        # 直接使用上游的错误响应
+                        error_output = error_json
                     except:
                         if "账户池都无可用" in error_msg:
                             should_return_500 = True
+                        # JSON 解析失败，包装成标准格式
+                        error_output = {
+                            "error": {
+                                "message": error_msg,
+                                "type": "upstream_error",
+                                "code": str(response.status_code)
+                            }
+                        }
                     
                     # 如果上游返回 402，也需要返回 500
                     if response.status_code == 402:
                         should_return_500 = True
                     
-                    error_chunk = {
-                        "error": {
-                            "message": f"Upstream error: {error_msg}",
-                            "type": "upstream_error",
-                            "code": "500" if should_return_500 else str(response.status_code)
-                        }
-                    }
-                    yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                    # 如果需要返回 500，在错误信息中添加标记
+                    if should_return_500 and "error" in error_output:
+                        error_output["error"]["upstream_status_code"] = response.status_code
+                        error_output["error"]["gateway_status_code"] = 500
+                    
+                    yield f"data: {json.dumps(error_output, ensure_ascii=False)}\n\n"
                     return
                 
                 async for line in response.aiter_lines():
@@ -802,14 +811,11 @@ async def handle_stream_response(
                                                      "账户池都无可用" in error_message or
                                                      "quota" in error_message.lower())
                                 
-                                error_chunk = {
-                                    "error": {
-                                        "message": error_message or f"Upstream error: {data_str}",
-                                        "type": error_info.get("type", "upstream_error"),
-                                        "code": "500" if should_return_500 else str(error_code or "unknown")
-                                    }
-                                }
-                                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                                # 直接透传上游的错误响应，添加状态码标记
+                                if should_return_500:
+                                    event_data["error"]["gateway_status_code"] = 500
+                                
+                                yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
                                 return
                             
                             # 处理事件
@@ -897,6 +903,7 @@ async def handle_non_stream_response(
                 # 检查是否为需要返回 500 状态码的错误（让网关触发自动禁用）
                 # 包括：账户池无可用(503)、配额不足(402)
                 should_return_500 = False
+                error_output = None
                 try:
                     error_data = json.loads(error_text)
                     error_code = error_data.get("error", {}).get("code")
@@ -906,18 +913,32 @@ async def handle_non_stream_response(
                        "账户池都无可用" in error_message or \
                        response.status_code == 402:
                         should_return_500 = True
+                    # 直接使用上游的错误响应
+                    error_output = error_data
                 except:
-                    error_data = {"message": error_text}
                     if "账户池都无可用" in error_text:
                         should_return_500 = True
+                    # JSON 解析失败，包装成标准格式
+                    error_output = {
+                        "error": {
+                            "message": error_text,
+                            "type": "upstream_error",
+                            "code": str(response.status_code)
+                        }
+                    }
                 
                 # 如果上游返回 402，也需要返回 500
                 if response.status_code == 402:
                     should_return_500 = True
                 
+                # 添加状态码标记信息
+                if should_return_500 and "error" in error_output:
+                    error_output["error"]["upstream_status_code"] = response.status_code
+                    error_output["error"]["gateway_status_code"] = 500
+                
                 return JSONResponse(
                     status_code=500 if should_return_500 else response.status_code,
-                    content={"error": error_data}
+                    content=error_output
                 )
             
             async for line in response.aiter_lines():
@@ -955,9 +976,13 @@ async def handle_non_stream_response(
                                                  "账户池都无可用" in error_message or
                                                  "quota" in error_message.lower())
                             
+                            # 直接透传上游的错误响应，添加状态码标记
+                            if should_return_500:
+                                event_data["error"]["gateway_status_code"] = 500
+                            
                             return JSONResponse(
                                 status_code=500 if should_return_500 else 502,
-                                content={"error": error_info}
+                                content=event_data
                             )
                         
                         if current_event_type:
