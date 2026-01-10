@@ -733,22 +733,31 @@ async def handle_stream_response(
                     error_msg = error_body.decode("utf-8", errors="ignore")
                     logger.error(f"上游错误响应: {error_msg}")
                     
-                    # 检查是否为账户池无可用错误，返回 500 状态码
-                    is_pool_unavailable = False
+                    # 检查是否为需要返回 500 状态码的错误（让网关触发自动禁用）
+                    # 包括：账户池无可用(503)、配额不足(402)
+                    should_return_500 = False
                     try:
                         error_json = json.loads(error_msg)
-                        if error_json.get("error", {}).get("code") == 503 or \
-                           "账户池都无可用" in error_json.get("error", {}).get("message", ""):
-                            is_pool_unavailable = True
+                        error_code = error_json.get("error", {}).get("code")
+                        error_message = error_json.get("error", {}).get("message", "")
+                        if error_code == 503 or \
+                           error_code == "plan_quota_exceeded" or \
+                           "账户池都无可用" in error_message or \
+                           response.status_code == 402:
+                            should_return_500 = True
                     except:
                         if "账户池都无可用" in error_msg:
-                            is_pool_unavailable = True
+                            should_return_500 = True
+                    
+                    # 如果上游返回 402，也需要返回 500
+                    if response.status_code == 402:
+                        should_return_500 = True
                     
                     error_chunk = {
                         "error": {
                             "message": f"Upstream error: {error_msg}",
                             "type": "upstream_error",
-                            "code": "500" if is_pool_unavailable else str(response.status_code)
+                            "code": "500" if should_return_500 else str(response.status_code)
                         }
                     }
                     yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
@@ -778,23 +787,26 @@ async def handle_stream_response(
                             event_data = json.loads(data_str)
                             logger.debug(f"解析事件数据: type={event_data.get('type', current_event_type)}")
                             
-                            # 检查是否为上游错误响应（如账户池无可用）
+                            # 检查是否为上游错误响应（如账户池无可用、配额不足）
                             if "error" in event_data:
                                 error_info = event_data.get("error", {})
                                 error_code = error_info.get("code")
                                 error_message = error_info.get("message", "")
                                 logger.error(f"上游错误响应: {json.dumps(event_data, ensure_ascii=False)}")
                                 
-                                # 检查是否为账户池无可用错误
-                                is_pool_unavailable = (error_code == 503 or 
-                                                       error_code == "503" or 
-                                                       "账户池都无可用" in error_message)
+                                # 检查是否为需要返回 500 的错误（让网关触发自动禁用）
+                                # 包括：账户池无可用(503)、配额不足(plan_quota_exceeded)
+                                should_return_500 = (error_code == 503 or 
+                                                     error_code == "503" or 
+                                                     error_code == "plan_quota_exceeded" or
+                                                     "账户池都无可用" in error_message or
+                                                     "quota" in error_message.lower())
                                 
                                 error_chunk = {
                                     "error": {
                                         "message": error_message or f"Upstream error: {data_str}",
                                         "type": error_info.get("type", "upstream_error"),
-                                        "code": "500" if is_pool_unavailable else str(error_code or "unknown")
+                                        "code": "500" if should_return_500 else str(error_code or "unknown")
                                     }
                                 }
                                 yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
@@ -882,20 +894,29 @@ async def handle_non_stream_response(
                 error_text = error_body.decode("utf-8", errors="ignore")
                 logger.error(f"上游错误响应: {error_text}")
                 
-                # 检查是否为账户池无可用错误，返回 500 状态码
-                is_pool_unavailable = False
+                # 检查是否为需要返回 500 状态码的错误（让网关触发自动禁用）
+                # 包括：账户池无可用(503)、配额不足(402)
+                should_return_500 = False
                 try:
                     error_data = json.loads(error_text)
-                    if error_data.get("error", {}).get("code") == 503 or \
-                       "账户池都无可用" in error_data.get("error", {}).get("message", ""):
-                        is_pool_unavailable = True
+                    error_code = error_data.get("error", {}).get("code")
+                    error_message = error_data.get("error", {}).get("message", "")
+                    if error_code == 503 or \
+                       error_code == "plan_quota_exceeded" or \
+                       "账户池都无可用" in error_message or \
+                       response.status_code == 402:
+                        should_return_500 = True
                 except:
                     error_data = {"message": error_text}
                     if "账户池都无可用" in error_text:
-                        is_pool_unavailable = True
+                        should_return_500 = True
+                
+                # 如果上游返回 402，也需要返回 500
+                if response.status_code == 402:
+                    should_return_500 = True
                 
                 return JSONResponse(
-                    status_code=500 if is_pool_unavailable else response.status_code,
+                    status_code=500 if should_return_500 else response.status_code,
                     content={"error": error_data}
                 )
             
@@ -919,20 +940,23 @@ async def handle_non_stream_response(
                         event_data = json.loads(data_str)
                         logger.debug(f"解析事件数据: type={event_data.get('type', current_event_type)}")
                         
-                        # 检查是否为上游错误响应（如账户池无可用）
+                        # 检查是否为上游错误响应（如账户池无可用、配额不足）
                         if "error" in event_data:
                             error_info = event_data.get("error", {})
                             error_code = error_info.get("code")
                             error_message = error_info.get("message", "")
                             logger.error(f"上游错误响应: {json.dumps(event_data, ensure_ascii=False)}")
                             
-                            # 检查是否为账户池无可用错误
-                            is_pool_unavailable = (error_code == 503 or 
-                                                   error_code == "503" or 
-                                                   "账户池都无可用" in error_message)
+                            # 检查是否为需要返回 500 的错误（让网关触发自动禁用）
+                            # 包括：账户池无可用(503)、配额不足(plan_quota_exceeded)
+                            should_return_500 = (error_code == 503 or 
+                                                 error_code == "503" or 
+                                                 error_code == "plan_quota_exceeded" or
+                                                 "账户池都无可用" in error_message or
+                                                 "quota" in error_message.lower())
                             
                             return JSONResponse(
-                                status_code=500 if is_pool_unavailable else 502,
+                                status_code=500 if should_return_500 else 502,
                                 content={"error": error_info}
                             )
                         
