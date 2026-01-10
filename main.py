@@ -159,9 +159,53 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
     
     # 构建 input 数组，包含所有消息
     # 注意：Response API 不支持 system 角色，将其转换为 developer 角色
+    # Response API 不支持 tool 角色，需要转换为 function_call_output 类型
     input_items = []
     
     for msg in chat_request.messages:
+        # 特殊处理 tool 角色 - 转换为 function_call_output 类型
+        if msg.role == "tool":
+            # Chat API tool 消息格式:
+            # {"role": "tool", "tool_call_id": "xxx", "content": "result"}
+            # -> Response API 格式:
+            # {"type": "function_call_output", "call_id": "xxx", "output": "result"}
+            tool_output_item = {
+                "type": "function_call_output",
+                "call_id": msg.tool_call_id or "",
+                "output": msg.content if isinstance(msg.content, str) else json.dumps(msg.content) if msg.content else ""
+            }
+            input_items.append(tool_output_item)
+            continue
+        
+        # 特殊处理 assistant 消息中的 tool_calls
+        if msg.role == "assistant" and msg.tool_calls:
+            # 先添加 assistant 消息内容（如果有）
+            if msg.content:
+                content = msg.content if isinstance(msg.content, str) else msg.content
+                item = {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content
+                }
+                input_items.append(item)
+            
+            # 然后添加 function_call 类型的项
+            # Chat API tool_calls 格式:
+            # [{"id": "call_xxx", "type": "function", "function": {"name": "xxx", "arguments": "{...}"}}]
+            # -> Response API 格式:
+            # {"type": "function_call", "call_id": "call_xxx", "name": "xxx", "arguments": "{...}"}
+            for tool_call in msg.tool_calls:
+                if tool_call.get("type") == "function":
+                    func = tool_call.get("function", {})
+                    func_call_item = {
+                        "type": "function_call",
+                        "call_id": tool_call.get("id", ""),
+                        "name": func.get("name", ""),
+                        "arguments": func.get("arguments", "{}")
+                    }
+                    input_items.append(func_call_item)
+            continue
+        
         # 处理 content 字段，转换多模态内容格式
         if msg.content is None:
             # content 为空（通常在 assistant 消息有 tool_calls 时）
