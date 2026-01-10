@@ -169,9 +169,14 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
             # {"role": "tool", "tool_call_id": "xxx", "content": "result"}
             # -> Response API 格式:
             # {"type": "function_call_output", "call_id": "xxx", "output": "result"}
+            # 如果 tool_call_id 为空，生成一个 UUID（Response API 要求 call_id 非空）
+            call_id = msg.tool_call_id
+            if not call_id:
+                call_id = f"call_{uuid.uuid4().hex[:24]}"
+                logger.warning(f"tool 消息的 tool_call_id 为空，自动生成: {call_id}")
             tool_output_item = {
                 "type": "function_call_output",
-                "call_id": msg.tool_call_id or "",
+                "call_id": call_id,
                 "output": msg.content if isinstance(msg.content, str) else json.dumps(msg.content) if msg.content else ""
             }
             input_items.append(tool_output_item)
@@ -195,11 +200,18 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
             # -> Response API 格式:
             # {"type": "function_call", "call_id": "call_xxx", "name": "xxx", "arguments": "{...}"}
             for tool_call in msg.tool_calls:
-                if tool_call.get("type") == "function":
+                # 处理 type 为 function 或 None 的情况（某些客户端可能不发送 type 字段）
+                tool_type = tool_call.get("type")
+                if tool_type == "function" or tool_type is None:
                     func = tool_call.get("function", {})
+                    # 如果 id 为空，生成一个 UUID（Response API 要求 call_id 非空）
+                    call_id = tool_call.get("id")
+                    if not call_id:
+                        call_id = f"call_{uuid.uuid4().hex[:24]}"
+                        logger.warning(f"tool_call 的 id 为空，自动生成: {call_id}")
                     func_call_item = {
                         "type": "function_call",
-                        "call_id": tool_call.get("id", ""),
+                        "call_id": call_id,
                         "name": func.get("name", ""),
                         "arguments": func.get("arguments", "{}")
                     }
