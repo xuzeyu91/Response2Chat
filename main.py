@@ -162,18 +162,56 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
     # Response API 不支持 tool 角色，需要转换为 function_call_output 类型
     input_items = []
     
-    for msg in chat_request.messages:
+    # 预处理：为空的 tool_call.id 和对应的 tool.tool_call_id 建立映射
+    # 按顺序匹配：每个 assistant 的 tool_calls 后面紧跟着对应数量的 tool 消息
+    generated_call_ids: Dict[int, str] = {}  # 消息索引 -> 生成的 call_id
+    tool_call_id_mapping: Dict[int, List[str]] = {}  # assistant 消息索引 -> 该消息生成的 call_ids 列表
+    
+    # 第一遍扫描：识别需要生成 call_id 的 tool_calls，并建立映射
+    pending_call_ids: List[str] = []  # 待匹配的 call_ids 队列
+    for i, msg in enumerate(chat_request.messages):
+        if msg.role == "assistant" and msg.tool_calls:
+            tool_call_id_mapping[i] = []
+            for tool_call in msg.tool_calls:
+                original_id = tool_call.get("id")
+                if original_id:
+                    # 有原始 id，直接使用
+                    pending_call_ids.append(original_id)
+                    tool_call_id_mapping[i].append(original_id)
+                else:
+                    # 没有原始 id，生成一个新的
+                    new_id = f"call_{uuid.uuid4().hex[:24]}"
+                    pending_call_ids.append(new_id)
+                    tool_call_id_mapping[i].append(new_id)
+                    logger.warning(f"tool_call 的 id 为空，自动生成: {new_id}")
+        elif msg.role == "tool":
+            # tool 消息需要匹配 call_id
+            if msg.tool_call_id:
+                # 有原始 tool_call_id，直接使用
+                generated_call_ids[i] = msg.tool_call_id
+            elif pending_call_ids:
+                # 没有 tool_call_id，从队列中取一个
+                generated_call_ids[i] = pending_call_ids.pop(0)
+                logger.warning(f"tool 消息的 tool_call_id 为空，使用匹配的 call_id: {generated_call_ids[i]}")
+            else:
+                # 队列为空，生成一个新的（这种情况不应该发生）
+                generated_call_ids[i] = f"call_{uuid.uuid4().hex[:24]}"
+                logger.warning(f"tool 消息的 tool_call_id 为空且无法匹配，自动生成: {generated_call_ids[i]}")
+    
+    # 重置 pending_call_ids 用于第二遍
+    pending_call_ids_iter = iter([])
+    current_assistant_idx = -1
+    current_tool_call_idx = 0
+    
+    # 第二遍：实际构建 input_items
+    for i, msg in enumerate(chat_request.messages):
         # 特殊处理 tool 角色 - 转换为 function_call_output 类型
         if msg.role == "tool":
             # Chat API tool 消息格式:
             # {"role": "tool", "tool_call_id": "xxx", "content": "result"}
             # -> Response API 格式:
             # {"type": "function_call_output", "call_id": "xxx", "output": "result"}
-            # 如果 tool_call_id 为空，生成一个 UUID（Response API 要求 call_id 非空）
-            call_id = msg.tool_call_id
-            if not call_id:
-                call_id = f"call_{uuid.uuid4().hex[:24]}"
-                logger.warning(f"tool 消息的 tool_call_id 为空，自动生成: {call_id}")
+            call_id = generated_call_ids.get(i, msg.tool_call_id or f"call_{uuid.uuid4().hex[:24]}")
             tool_output_item = {
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -194,21 +232,24 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
                 }
                 input_items.append(item)
             
+            # 获取预先生成的 call_ids
+            pre_generated_ids = tool_call_id_mapping.get(i, [])
+            
             # 然后添加 function_call 类型的项
             # Chat API tool_calls 格式:
             # [{"id": "call_xxx", "type": "function", "function": {"name": "xxx", "arguments": "{...}"}}]
             # -> Response API 格式:
             # {"type": "function_call", "call_id": "call_xxx", "name": "xxx", "arguments": "{...}"}
-            for tool_call in msg.tool_calls:
+            for j, tool_call in enumerate(msg.tool_calls):
                 # 处理 type 为 function 或 None 的情况（某些客户端可能不发送 type 字段）
                 tool_type = tool_call.get("type")
                 if tool_type == "function" or tool_type is None:
                     func = tool_call.get("function", {})
-                    # 如果 id 为空，生成一个 UUID（Response API 要求 call_id 非空）
-                    call_id = tool_call.get("id")
-                    if not call_id:
-                        call_id = f"call_{uuid.uuid4().hex[:24]}"
-                        logger.warning(f"tool_call 的 id 为空，自动生成: {call_id}")
+                    # 使用预先生成的 call_id
+                    if j < len(pre_generated_ids):
+                        call_id = pre_generated_ids[j]
+                    else:
+                        call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
                     
                     # 如果 name 为空，尝试从 arguments 中推断工具名称
                     func_name = func.get("name", "")
