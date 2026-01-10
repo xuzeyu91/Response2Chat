@@ -40,7 +40,7 @@ DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "300"))
 # Chat API 请求模型
 class ChatMessage(BaseModel):
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None  # 允许为 None，当有 tool_calls 时可能为空
     name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
@@ -163,7 +163,10 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
     
     for msg in chat_request.messages:
         # 处理 content 字段，转换多模态内容格式
-        if isinstance(msg.content, str):
+        if msg.content is None:
+            # content 为空（通常在 assistant 消息有 tool_calls 时）
+            converted_content = ""
+        elif isinstance(msg.content, str):
             # 纯文本内容
             converted_content = msg.content
         elif isinstance(msg.content, list):
