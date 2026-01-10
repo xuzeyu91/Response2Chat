@@ -209,10 +209,29 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
                     if not call_id:
                         call_id = f"call_{uuid.uuid4().hex[:24]}"
                         logger.warning(f"tool_call 的 id 为空，自动生成: {call_id}")
+                    
+                    # 如果 name 为空，尝试从 arguments 中推断工具名称
+                    func_name = func.get("name", "")
+                    if not func_name:
+                        # 尝试从 arguments 推断工具名称
+                        args_str = func.get("arguments", "{}")
+                        try:
+                            args_dict = json.loads(args_str) if isinstance(args_str, str) else args_str
+                            # 常见工具参数到工具名的映射
+                            if "thought" in args_dict:
+                                func_name = "think"
+                            elif "code" in args_dict and "file_name" in args_dict:
+                                func_name = "save_to_file_and_run"
+                            else:
+                                func_name = f"unknown_function_{uuid.uuid4().hex[:8]}"
+                        except:
+                            func_name = f"unknown_function_{uuid.uuid4().hex[:8]}"
+                        logger.warning(f"tool_call 的 name 为空，推断为: {func_name}")
+                    
                     func_call_item = {
                         "type": "function_call",
                         "call_id": call_id,
-                        "name": func.get("name", ""),
+                        "name": func_name,
                         "arguments": func.get("arguments", "{}")
                     }
                     input_items.append(func_call_item)
