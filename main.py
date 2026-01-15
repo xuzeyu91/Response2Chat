@@ -375,14 +375,27 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
     if chat_request.reasoning_effort is not None:
         response_request["reasoning"] = {"effort": chat_request.reasoning_effort}
     
-    # response_format 支持 (如 json_object)
+    # response_format 支持 (如 json_object, json_schema)
     if chat_request.response_format is not None:
         # Response API 可能使用不同的格式，尝试转换
         fmt_type = chat_request.response_format.get("type")
         if fmt_type == "json_object":
             response_request["text"] = {"format": {"type": "json_object"}}
         elif fmt_type == "json_schema":
-            response_request["text"] = {"format": chat_request.response_format}
+            # Chat API json_schema 格式:
+            # {"type": "json_schema", "json_schema": {"name": "xxx", "schema": {...}, "strict": true}}
+            # Response API 格式:
+            # {"format": {"type": "json_schema", "name": "xxx", "schema": {...}, "strict": true}}
+            json_schema_obj = chat_request.response_format.get("json_schema", {})
+            response_format = {
+                "type": "json_schema",
+                "name": json_schema_obj.get("name", "response_schema"),
+                "schema": json_schema_obj.get("schema", {}),
+            }
+            # 只有在 strict 存在时才添加
+            if "strict" in json_schema_obj:
+                response_format["strict"] = json_schema_obj.get("strict")
+            response_request["text"] = {"format": response_format}
     
     # 以下参数某些 Response API 可能不支持，根据需要启用
     # if chat_request.temperature is not None and chat_request.temperature != 1:
