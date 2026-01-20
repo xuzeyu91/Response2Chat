@@ -35,6 +35,11 @@ if not RESPONSE_API_BASE:
     raise ValueError("必须配置 RESPONSE_API_BASE 环境变量，请在 .env 文件中设置 Response API 的基础 URL")
 DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "300"))
 
+# 连接池配置 - 防止连接泄漏和资源耗尽
+MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "100"))  # 最大连接数
+MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "30"))  # 保持活跃的连接数
+KEEPALIVE_EXPIRY = int(os.getenv("KEEPALIVE_EXPIRY", "60"))  # 连接保持时间(秒)
+
 # ==================== Pydantic 模型定义 ====================
 
 # Chat API 请求模型
@@ -635,9 +640,28 @@ async def parse_sse_line(line: str) -> tuple[Optional[str], Optional[Dict[str, A
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    app.state.http_client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    # 配置连接池限制，防止长时间运行后连接泄漏
+    limits = httpx.Limits(
+        max_connections=MAX_CONNECTIONS,
+        max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+        keepalive_expiry=KEEPALIVE_EXPIRY
+    )
+    # 配置超时：连接超时、读取超时、写入超时、连接池获取超时
+    timeout = httpx.Timeout(
+        connect=30.0,      # 连接超时
+        read=DEFAULT_TIMEOUT,  # 读取超时
+        write=30.0,        # 写入超时  
+        pool=10.0          # 从连接池获取连接的超时
+    )
+    app.state.http_client = httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        http2=True  # 启用 HTTP/2 提升长连接性能
+    )
+    logger.info(f"HTTP 客户端初始化: max_connections={MAX_CONNECTIONS}, keepalive={MAX_KEEPALIVE_CONNECTIONS}, expiry={KEEPALIVE_EXPIRY}s")
     yield
     await app.state.http_client.aclose()
+    logger.info("HTTP 客户端已关闭")
 
 app = FastAPI(
     title="Response to Chat API Proxy",
@@ -728,6 +752,7 @@ async def handle_stream_response(
     async def stream_generator():
         processor = ResponseStreamProcessor(chat_id, model, include_usage)
         current_event_type = None
+        response = None
         
         try:
             logger.debug(f"开始流式请求到 {url}")
@@ -862,6 +887,31 @@ async def handle_stream_response(
                 }
             }
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        except httpx.RemoteProtocolError as e:
+            logger.error(f"远程协议错误(可能是连接被重置): {str(e)}")
+            error_chunk = {
+                "error": {
+                    "message": f"Connection reset: {str(e)}",
+                    "type": "connection_error"
+                }
+            }
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        except httpx.ReadError as e:
+            logger.error(f"读取错误: {str(e)}")
+            error_chunk = {
+                "error": {
+                    "message": f"Read error: {str(e)}",
+                    "type": "connection_error"
+                }
+            }
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            logger.warning(f"流式请求被取消 (客户端可能断开连接): chat_id={chat_id}")
+            # 不需要 yield 错误，客户端已断开
+            return
+        except GeneratorExit:
+            logger.warning(f"生成器退出 (客户端断开): chat_id={chat_id}")
+            return
         except Exception as e:
             logger.error(f"流式处理异常: {str(e)}\n{traceback.format_exc()}")
             error_chunk = {
@@ -871,6 +921,8 @@ async def handle_stream_response(
                 }
             }
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        finally:
+            logger.debug(f"流式生成器结束: chat_id={chat_id}")
     
     return StreamingResponse(
         stream_generator(),
@@ -1036,9 +1088,35 @@ async def handle_non_stream_response(
 
 
 @app.get("/health")
-async def health_check():
-    """健康检查接口"""
-    return {"status": "ok", "service": "response-to-chat-proxy"}
+async def health_check(request: Request):
+    """健康检查接口 - 包含连接池状态"""
+    client: httpx.AsyncClient = request.app.state.http_client
+    
+    # 获取连接池统计信息
+    pool_status = {}
+    try:
+        # httpx 的连接池信息
+        if hasattr(client, '_transport') and client._transport:
+            transport = client._transport
+            if hasattr(transport, '_pool'):
+                pool = transport._pool
+                pool_status = {
+                    "connections_in_pool": len(pool._connections) if hasattr(pool, '_connections') else "unknown"
+                }
+    except Exception as e:
+        pool_status = {"error": str(e)}
+    
+    return {
+        "status": "ok", 
+        "service": "response-to-chat-proxy",
+        "pool_status": pool_status,
+        "config": {
+            "max_connections": MAX_CONNECTIONS,
+            "max_keepalive_connections": MAX_KEEPALIVE_CONNECTIONS,
+            "keepalive_expiry": KEEPALIVE_EXPIRY,
+            "default_timeout": DEFAULT_TIMEOUT
+        }
+    }
 
 
 @app.get("/v1/models")
