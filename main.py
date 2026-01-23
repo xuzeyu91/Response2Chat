@@ -40,6 +40,13 @@ MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "100"))  # 最大连接数
 MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "30"))  # 保持活跃的连接数
 KEEPALIVE_EXPIRY = int(os.getenv("KEEPALIVE_EXPIRY", "60"))  # 连接保持时间(秒)
 
+# 默认系统提示词配置
+# 当请求中没有 system 消息时，会使用此默认提示词
+# 设置为空字符串可禁用默认提示词
+DEFAULT_INSTRUCTIONS = os.getenv("DEFAULT_INSTRUCTIONS", "").strip()
+# 是否强制使用默认提示词（即使请求中有 system 消息也会添加）
+FORCE_DEFAULT_INSTRUCTIONS = os.getenv("FORCE_DEFAULT_INSTRUCTIONS", "false").lower() == "true"
+
 # ==================== Pydantic 模型定义 ====================
 
 # Chat API 请求模型
@@ -341,6 +348,16 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
         "input": input_items,
         "stream": True,  # Response API 始终使用 stream
     }
+    
+    # 处理 instructions 参数
+    # 检查请求中是否已有 system 消息
+    has_system_message = any(msg.role == "system" for msg in chat_request.messages)
+    
+    if DEFAULT_INSTRUCTIONS:
+        if FORCE_DEFAULT_INSTRUCTIONS or not has_system_message:
+            # 使用配置的默认 instructions
+            response_request["instructions"] = DEFAULT_INSTRUCTIONS
+            logger.debug(f"使用默认 instructions: {DEFAULT_INSTRUCTIONS[:50]}...")
     
     # 可选参数映射 - 只添加 Response API 支持的参数
     # 注意：某些 Response API 可能不支持 temperature, top_p, max_output_tokens 等参数
