@@ -14,6 +14,8 @@ services:
       - PORT=8000
       - DEFAULT_TIMEOUT=300
       - LOG_LEVEL=INFO
+      - DEFAULT_INSTRUCTIONS=${DEFAULT_INSTRUCTIONS}
+      - FORCE_DEFAULT_INSTRUCTIONS=${FORCE_DEFAULT_INSTRUCTIONS}
     env_file:
       - .env
     restart: unless-stopped
