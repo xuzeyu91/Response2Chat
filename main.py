@@ -34,6 +34,9 @@ RESPONSE_API_BASE = os.getenv("RESPONSE_API_BASE")
 if not RESPONSE_API_BASE:
     raise ValueError("必须配置 RESPONSE_API_BASE 环境变量，请在 .env 文件中设置 Response API 的基础 URL")
 DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "300"))
+POOL_TIMEOUT = float(os.getenv("POOL_TIMEOUT", "10"))
+STREAM_READ_TIMEOUT = float(os.getenv("STREAM_READ_TIMEOUT", "120"))
+STREAM_MAX_DURATION = int(os.getenv("STREAM_MAX_DURATION", "0"))  # 0 表示不限制
 
 # 连接池配置 - 防止连接泄漏和资源耗尽
 MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "100"))  # 最大连接数
@@ -668,7 +671,7 @@ async def lifespan(app: FastAPI):
         connect=30.0,      # 连接超时
         read=DEFAULT_TIMEOUT,  # 读取超时
         write=30.0,        # 写入超时  
-        pool=10.0          # 从连接池获取连接的超时
+        pool=POOL_TIMEOUT          # 从连接池获取连接的超时
     )
     app.state.http_client = httpx.AsyncClient(
         timeout=timeout,
@@ -770,6 +773,7 @@ async def handle_stream_response(
         processor = ResponseStreamProcessor(chat_id, model, include_usage)
         current_event_type = None
         response = None
+        start_time = time.monotonic()
         
         try:
             logger.debug(f"开始流式请求到 {url}")
@@ -778,7 +782,12 @@ async def handle_stream_response(
                 url,
                 headers=headers,
                 json=request_body,
-                timeout=DEFAULT_TIMEOUT
+                timeout=httpx.Timeout(
+                    connect=30.0,
+                    read=STREAM_READ_TIMEOUT,
+                    write=30.0,
+                    pool=POOL_TIMEOUT
+                )
             ) as response:
                 logger.info(f"上游响应状态码: {response.status_code}")
                 logger.debug(f"上游响应头: {dict(response.headers)}")
@@ -828,6 +837,17 @@ async def handle_stream_response(
                     return
                 
                 async for line in response.aiter_lines():
+                    if STREAM_MAX_DURATION > 0 and (time.monotonic() - start_time) > STREAM_MAX_DURATION:
+                        logger.error(f"流式请求超过最大持续时间: {STREAM_MAX_DURATION}s, chat_id={chat_id}")
+                        error_chunk = {
+                            "error": {
+                                "message": "Stream max duration exceeded",
+                                "type": "timeout_error"
+                            }
+                        }
+                        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                        return
+
                     line = line.strip()
                     if not line:
                         continue
@@ -1131,7 +1151,10 @@ async def health_check(request: Request):
             "max_connections": MAX_CONNECTIONS,
             "max_keepalive_connections": MAX_KEEPALIVE_CONNECTIONS,
             "keepalive_expiry": KEEPALIVE_EXPIRY,
-            "default_timeout": DEFAULT_TIMEOUT
+            "default_timeout": DEFAULT_TIMEOUT,
+            "pool_timeout": POOL_TIMEOUT,
+            "stream_read_timeout": STREAM_READ_TIMEOUT,
+            "stream_max_duration": STREAM_MAX_DURATION
         }
     }
 
