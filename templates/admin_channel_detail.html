@@ -24,6 +24,16 @@
                     <input type="text" name="upstream_api_key" placeholder="留空表示保持当前值不变" />
                 </label>
             </div>
+            <div class="form-grid single">
+                <label>
+                    转换类型
+                    <select name="protocol_type">
+                        <option value="response_to_chat" ${response_to_chat_selected}>Responses → Chat（客户端调用 /v1/chat/completions）</option>
+                        <option value="chat_to_response" ${chat_to_response_selected}>Chat → Responses（客户端调用 /v1/responses）</option>
+                    </select>
+                    <span class="helper-text">切换后，新的请求会按选择的方向进行协议转换；渠道访问 Key 保持不变。</span>
+                </label>
+            </div>
             <label>
                 <span>清空当前上游 API Key</span>
                 <span class="helper-text">如需切换为无鉴权上游，勾选此项后保存即可清空当前保存的上游密钥。</span>

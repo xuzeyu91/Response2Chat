@@ -11,6 +11,18 @@ from threading import Lock
 from typing import Any, Dict, List, Optional
 
 
+# The direction is expressed from the upstream protocol to the protocol exposed
+# by this proxy.  Keep the original Response -> Chat behavior as the default so
+# existing databases, channels, and clients remain compatible after upgrade.
+CHANNEL_TYPE_RESPONSE_TO_CHAT = "response_to_chat"
+CHANNEL_TYPE_CHAT_TO_RESPONSE = "chat_to_response"
+DEFAULT_CHANNEL_TYPE = CHANNEL_TYPE_RESPONSE_TO_CHAT
+VALID_CHANNEL_TYPES = {
+    CHANNEL_TYPE_RESPONSE_TO_CHAT,
+    CHANNEL_TYPE_CHAT_TO_RESPONSE,
+}
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -26,6 +38,13 @@ def normalize_base_url(base_url: str) -> str:
             break
 
     return value.rstrip("/")
+
+
+def normalize_channel_type(channel_type: Optional[str]) -> str:
+    value = (channel_type or DEFAULT_CHANNEL_TYPE).strip().lower()
+    if value not in VALID_CHANNEL_TYPES:
+        raise ValueError("渠道转换类型无效")
+    return value
 
 
 def generate_access_key() -> str:
@@ -120,6 +139,7 @@ class SettingsStore:
                     description TEXT NOT NULL DEFAULT '',
                     upstream_base_url TEXT NOT NULL,
                     upstream_api_key TEXT NOT NULL DEFAULT '',
+                    protocol_type TEXT NOT NULL DEFAULT 'response_to_chat',
                     access_key TEXT NOT NULL UNIQUE,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -127,6 +147,18 @@ class SettingsStore:
                 )
                 """
             )
+            # SQLite does not apply new CREATE TABLE columns to an existing
+            # table.  Make the schema migration explicit and idempotent.
+            channel_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(channels)").fetchall()
+            }
+            if "protocol_type" not in channel_columns:
+                conn.execute(
+                    "ALTER TABLE channels "
+                    "ADD COLUMN protocol_type TEXT NOT NULL "
+                    "DEFAULT 'response_to_chat'"
+                )
             conn.commit()
 
         self._ensure_default_admin()
@@ -195,7 +227,7 @@ class SettingsStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, name, description, upstream_base_url, upstream_api_key,
+                SELECT id, name, description, upstream_base_url, upstream_api_key, protocol_type,
                        access_key, enabled, created_at, updated_at
                 FROM channels
                 ORDER BY updated_at DESC, id DESC
@@ -221,7 +253,7 @@ class SettingsStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, name, description, upstream_base_url, upstream_api_key,
+                SELECT id, name, description, upstream_base_url, upstream_api_key, protocol_type,
                        access_key, enabled, created_at, updated_at
                 FROM channels
                 WHERE id = ?
@@ -253,12 +285,14 @@ class SettingsStore:
         base_url: str,
         upstream_api_key: str,
         description: str = "",
+        protocol_type: str = DEFAULT_CHANNEL_TYPE,
     ) -> Dict[str, Any]:
         clean_name = (name or "").strip()
         if not clean_name:
             raise ValueError("渠道名称不能为空")
 
         normalized_url = normalize_base_url(base_url)
+        normalized_protocol_type = normalize_channel_type(protocol_type)
         now = utc_now_iso()
 
         with self._connect() as conn:
@@ -268,15 +302,16 @@ class SettingsStore:
                     """
                     INSERT INTO channels (
                         name, description, upstream_base_url, upstream_api_key,
-                        access_key, enabled, created_at, updated_at
+                        protocol_type, access_key, enabled, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     (
                         clean_name,
                         (description or "").strip(),
                         normalized_url,
                         (upstream_api_key or "").strip(),
+                        normalized_protocol_type,
                         access_key,
                         now,
                         now,
@@ -305,6 +340,7 @@ class SettingsStore:
         description: str,
         enabled: bool,
         clear_upstream_api_key: bool = False,
+        protocol_type: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         existing = self.get_channel(channel_id)
         if not existing:
@@ -315,6 +351,9 @@ class SettingsStore:
             raise ValueError("渠道名称不能为空")
 
         normalized_url = normalize_base_url(base_url)
+        normalized_protocol_type = normalize_channel_type(
+            protocol_type if protocol_type is not None else existing["protocol_type"]
+        )
         next_upstream_api_key = existing["upstream_api_key"]
         if clear_upstream_api_key:
             next_upstream_api_key = ""
@@ -330,6 +369,7 @@ class SettingsStore:
                         description = ?,
                         upstream_base_url = ?,
                         upstream_api_key = ?,
+                        protocol_type = ?,
                         enabled = ?,
                         updated_at = ?
                     WHERE id = ?
@@ -339,6 +379,7 @@ class SettingsStore:
                         (description or "").strip(),
                         normalized_url,
                         next_upstream_api_key,
+                        normalized_protocol_type,
                         1 if enabled else 0,
                         utc_now_iso(),
                         channel_id,
@@ -397,7 +438,7 @@ class SettingsStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, name, description, upstream_base_url, upstream_api_key,
+                SELECT id, name, description, upstream_base_url, upstream_api_key, protocol_type,
                        access_key, enabled, created_at, updated_at
                 FROM channels
                 """
@@ -451,6 +492,7 @@ class SettingsStore:
             "description": row["description"],
             "upstream_base_url": row["upstream_base_url"],
             "upstream_api_key": row["upstream_api_key"],
+            "protocol_type": normalize_channel_type(row["protocol_type"]),
             "access_key": row["access_key"],
             "enabled": bool(row["enabled"]),
             "created_at": row["created_at"],

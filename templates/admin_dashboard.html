@@ -52,6 +52,14 @@
                     <input type="text" name="upstream_api_key" placeholder="sk-... (可选)" />
                 </label>
                 <label>
+                    转换类型
+                    <select name="protocol_type">
+                        <option value="response_to_chat" selected>Responses → Chat（默认）</option>
+                        <option value="chat_to_response">Chat → Responses</option>
+                    </select>
+                    <span class="helper-text">决定代理对外暴露的接口和上游协议：前者使用 <code>/v1/chat/completions</code>，后者使用 <code>/v1/responses</code>。</span>
+                </label>
+                <label>
                     描述
                     <textarea name="description" placeholder="可选，用途备注" style="min-height: 80px;"></textarea>
                 </label>
@@ -67,7 +75,7 @@
                     <p class="muted">自动替换 URL 和 Key</p>
                 </div>
             </div>
-            <div class="helper-text">原生兼容 /v1/chat/completions。<br/><br/>区别只在于 Authorization 放置系统分配的**渠道访问 key**，代理会平滑转发至上游。</div>
+            <div class="helper-text">Responses → Chat 渠道调用 <code>/v1/chat/completions</code>；Chat → Responses 渠道调用 <code>/v1/responses</code>。<br/><br/>Authorization 始终填写系统分配的渠道访问 key，真实上游 Key 不会暴露给客户端。</div>
         </div>
         <div class="card stack">
             <div class="section-title">

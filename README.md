@@ -1,6 +1,6 @@
 # Response2Chat API Proxy
 
-一个将 OpenAI **Response API** 协议自动转换为 **Chat API** 协议的代理服务，现已支持多渠道路由和内置管理后台。
+一个可在 OpenAI **Responses API** 与 **Chat Completions API** 之间双向转换的代理服务，支持多渠道路由和内置管理后台。
 
 ## 🎯 使用场景
 
@@ -26,6 +26,7 @@
 - ✅ **工具调用转换** - 支持 Tool Calls / Function Calling
 - ✅ **推理内容透传** - 支持 Reasoning Content 字段
 - ✅ **多模态内容** - 支持图片等多模态输入格式转换
+- ✅ **双向协议转换** - 渠道可选择 `Responses → Chat`（默认）或 `Chat → Responses`
 - ✅ **完整错误处理** - 超时控制和错误信息透传
 - ✅ **使用统计** - 支持 stream_options.include_usage
 
@@ -163,6 +164,17 @@ Compose 已默认把 /app/data 挂到 named volume response2chat-data。若需�
 
 所有外部客户端都调用当前代理服务，`Authorization` 里放的是系统生成的渠道 `access_key`，不是上游厂商的真实 API Key。
 
+### 转换类型
+
+每个渠道都有独立的“转换类型”，在管理后台创建或编辑渠道时选择：
+
+| 渠道类型 | 客户端调用代理 | 代理调用上游 | 默认值 |
+| --- | --- | --- | --- |
+| `Responses → Chat` | `/v1/chat/completions`（Chat 协议） | `/v1/responses`（Responses 协议） | 是 |
+| `Chat → Responses` | `/v1/responses`（Responses 协议） | `/v1/chat/completions`（Chat 协议） | 否 |
+
+已有渠道升级后会自动保持为 `Responses → Chat`，因此不会改变既有调用方式。对于 `Chat → Responses` 渠道，请使用 `/v1/responses`；如果误调用 `/v1/chat/completions`，代理会返回明确的 400 错误，避免静默按错误协议转发。
+
 ### Chat Completions
 
 完全兼容 OpenAI Chat API 格式：
@@ -207,7 +219,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
   }'
 ```
 
-### Responses 直通透传
+### Responses 直通透传（Responses → Chat 渠道）
 
 当客户端直接请求 `/v1/responses` 时，代理不会再做 `chat/completions -> responses` 转换，而是将请求体、查询参数和上游响应按原样透传。
 
@@ -223,6 +235,30 @@ curl -X POST "http://localhost:8000/v1/responses" \
 ```
 
 如果请求里带 `"stream": true`，代理会直接把上游 SSE 响应流原样返回给客户端。
+
+### Chat → Responses 调用示例
+
+当渠道类型为 `Chat → Responses` 时，客户端按标准 Responses API 请求代理；代理会在上游使用 Chat Completions API，并将结果转换回标准 Responses 对象或 Responses SSE 事件。
+
+```bash
+curl -X POST "http://localhost:8000/v1/responses" \
+  -H "Authorization: Bearer CHANNEL_ACCESS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "instructions": "Answer concisely.",
+    "input": [{
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Describe this image."},
+        {"type": "input_image", "image_url": "https://example.com/image.png"}
+      ]
+    }],
+    "stream": false
+  }'
+```
+
+`Chat → Responses` 的参数转换包括：`input` / `instructions`、`input_image`、函数工具定义与 `tool_choice`、`function_call` / `function_call_output` 对话续接、`max_output_tokens`、`reasoning.effort`、JSON 输出格式和 token usage。流式请求会输出 `response.created`、文本或函数参数 delta、`response.output_item.done`、`response.completed` 等标准 Responses SSE 事件。
 
 ### 健康检查
 
@@ -290,6 +326,21 @@ curl -H "Authorization: Bearer CHANNEL_ACCESS_KEY" http://localhost:8000/v1/mode
 
 
 > 注意：`system` 角色会自动转换为 `developer` 角色（Response API 规范）
+
+### Chat → Responses 参数映射
+
+| Responses API 参数 / 项目 | Chat Completions 映射 | 说明 |
+| --- | --- | --- |
+| `input` | `messages` | 文本消息、`input_text` 与 `input_image` 会转换；`instructions` 作为首个 `developer` 消息 |
+| `max_output_tokens` | `max_completion_tokens` | 最大输出 Token 数 |
+| `tools` | `tools[].function` | Responses 的扁平 function 定义转换为 Chat 嵌套定义 |
+| `tool_choice` | `tool_choice` | 指定 function 时自动调整结构 |
+| `function_call` | assistant `tool_calls` | 用于带工具历史的后续请求 |
+| `function_call_output` | `tool` message | 使用 `call_id` 关联函数结果 |
+| `reasoning.effort` | `reasoning_effort` | 推理强度 |
+| `text.format` | `response_format` | 支持 `json_object` 和 `json_schema` |
+
+返回时，Chat 的普通 assistant 消息会转成 Responses `message` / `output_text`，Chat function calls 会转成 Responses `function_call`；`prompt_tokens` / `completion_tokens` 同时映射为 `input_tokens` / `output_tokens`。
 
 ## 📝 响应格式
 

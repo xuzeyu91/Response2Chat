@@ -24,7 +24,13 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response, HTMLRes
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from channel_store import AdminSessionManager, SettingsStore, mask_secret
+from channel_store import (
+    AdminSessionManager,
+    CHANNEL_TYPE_CHAT_TO_RESPONSE,
+    CHANNEL_TYPE_RESPONSE_TO_CHAT,
+    SettingsStore,
+    mask_secret,
+)
 
 load_dotenv()
 
@@ -455,6 +461,323 @@ def convert_chat_to_response_request(chat_request: ChatCompletionRequest) -> Dic
     return response_request
 
 
+def serialize_content_as_text(value: Any) -> str:
+    """Convert a Responses tool output to the string form required by Chat."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def convert_response_content_to_chat(content: Any) -> Any:
+    """Map Responses message content parts to the Chat Completions equivalent."""
+    if content is None or isinstance(content, str):
+        return content or ""
+    if not isinstance(content, list):
+        return content
+
+    converted_content: List[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            converted_content.append(part)
+            continue
+
+        part_type = part.get("type")
+        if part_type in {"input_text", "output_text", "text"}:
+            converted_content.append({"type": "text", "text": part.get("text", "")})
+        elif part_type == "input_image":
+            image_url = part.get("image_url") or part.get("url") or ""
+            image_part: Dict[str, Any] = {"url": image_url}
+            if part.get("detail") is not None:
+                image_part["detail"] = part["detail"]
+            converted_content.append({"type": "image_url", "image_url": image_part})
+        else:
+            # Preserve vendor extension parts.  This makes the proxy forward
+            # compatible while explicitly converting the OpenAI text/image
+            # formats it owns.
+            converted_content.append(part)
+    return converted_content
+
+
+def convert_response_input_to_chat_messages(response_input: Any) -> List[Dict[str, Any]]:
+    """Convert Responses `input` (including prior tool turns) to Chat messages."""
+    if isinstance(response_input, str):
+        return [{"role": "user", "content": response_input}]
+    if not isinstance(response_input, list):
+        raise ValueError("Responses input must be a string or an array")
+
+    messages: List[Dict[str, Any]] = []
+    for item in response_input:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            raise ValueError("Responses input array contains an invalid item")
+
+        item_type = item.get("type", "message")
+        if item_type == "message":
+            role = item.get("role", "user")
+            messages.append(
+                {
+                    "role": role,
+                    "content": convert_response_content_to_chat(item.get("content")),
+                }
+            )
+        elif item_type == "function_call":
+            # A Responses function_call represents an assistant tool-call
+            # message in Chat.  Consecutive function calls belong to one
+            # assistant turn whenever possible.
+            if messages and messages[-1].get("role") == "assistant" and "tool_calls" in messages[-1]:
+                assistant_message = messages[-1]
+            else:
+                assistant_message = {"role": "assistant", "content": None, "tool_calls": []}
+                messages.append(assistant_message)
+            arguments = item.get("arguments", "{}")
+            assistant_message["tool_calls"].append(
+                {
+                    "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            )
+        elif item_type == "function_call_output":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "content": serialize_content_as_text(item.get("output")),
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported Responses input item type: {item_type}")
+    return messages
+
+
+def convert_response_to_chat_request(response_request: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a Responses request into a Chat Completions request."""
+    model = response_request.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Responses request must include a non-empty model")
+    if "input" not in response_request:
+        raise ValueError("Responses request must include input")
+
+    messages = convert_response_input_to_chat_messages(response_request["input"])
+    instructions = response_request.get("instructions")
+    if instructions:
+        messages.insert(0, {"role": "developer", "content": instructions})
+
+    chat_request: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": bool(response_request.get("stream", False)),
+    }
+
+    if response_request.get("max_output_tokens") is not None:
+        chat_request["max_completion_tokens"] = response_request["max_output_tokens"]
+    if response_request.get("temperature") is not None:
+        chat_request["temperature"] = response_request["temperature"]
+    if response_request.get("top_p") is not None:
+        chat_request["top_p"] = response_request["top_p"]
+    if response_request.get("user") is not None:
+        chat_request["user"] = response_request["user"]
+    if response_request.get("parallel_tool_calls") is not None:
+        chat_request["parallel_tool_calls"] = response_request["parallel_tool_calls"]
+
+    reasoning = response_request.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        chat_request["reasoning_effort"] = reasoning["effort"]
+
+    text = response_request.get("text")
+    if isinstance(text, dict) and isinstance(text.get("format"), dict):
+        response_format = dict(text["format"])
+        if response_format.get("type") == "json_schema":
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    key: value
+                    for key, value in response_format.items()
+                    if key != "type"
+                },
+            }
+        chat_request["response_format"] = response_format
+
+    if response_request.get("tools") is not None:
+        converted_tools: List[Dict[str, Any]] = []
+        for tool in response_request["tools"]:
+            if isinstance(tool, dict) and tool.get("type") == "function" and "function" not in tool:
+                function = {
+                    key: value
+                    for key, value in tool.items()
+                    if key in {"name", "description", "parameters", "strict"}
+                }
+                converted_tools.append({"type": "function", "function": function})
+            else:
+                converted_tools.append(tool)
+        chat_request["tools"] = converted_tools
+
+    tool_choice = response_request.get("tool_choice")
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function" and "function" not in tool_choice:
+        chat_request["tool_choice"] = {
+            "type": "function",
+            "function": {"name": tool_choice.get("name", "")},
+        }
+    elif tool_choice is not None:
+        chat_request["tool_choice"] = tool_choice
+
+    return chat_request
+
+
+def convert_chat_usage_to_response_usage(chat_usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Map Chat usage accounting to the equivalent Responses fields."""
+    if not isinstance(chat_usage, dict):
+        return None
+
+    response_usage: Dict[str, Any] = {
+        "input_tokens": chat_usage.get("prompt_tokens", 0),
+        "output_tokens": chat_usage.get("completion_tokens", 0),
+        "total_tokens": chat_usage.get("total_tokens", 0),
+    }
+    prompt_details = chat_usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict):
+        response_usage["input_tokens_details"] = {
+            key: value
+            for key, value in prompt_details.items()
+            if key in {"cached_tokens", "audio_tokens"}
+        }
+    completion_details = chat_usage.get("completion_tokens_details")
+    if isinstance(completion_details, dict):
+        response_usage["output_tokens_details"] = {
+            key: value
+            for key, value in completion_details.items()
+            if key in {
+                "reasoning_tokens",
+                "audio_tokens",
+                "accepted_prediction_tokens",
+                "rejected_prediction_tokens",
+            }
+        }
+    return response_usage
+
+
+def build_flat_tool_choice_fallback(chat_request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a retry body for providers that use Responses-style tool_choice in Chat.
+
+    OpenAI Chat Completions uses ``tool_choice.function.name``.  A few
+    OpenAI-compatible gateways instead expose Chat at the same path while
+    requiring the Responses shape (``tool_choice.name``).  We only use this
+    body after that exact validation error, never as the default.
+    """
+    tool_choice = chat_request.get("tool_choice")
+    if not isinstance(tool_choice, dict) or tool_choice.get("type") != "function":
+        return None
+    function = tool_choice.get("function")
+    if not isinstance(function, dict) or not function.get("name"):
+        return None
+    fallback = dict(chat_request)
+    fallback["tool_choice"] = {"type": "function", "name": function["name"]}
+    return fallback
+
+
+def upstream_requires_flat_tool_choice(response: httpx.Response) -> bool:
+    """Return true only for the documented nonstandard tool_choice error."""
+    if response.status_code != 400:
+        return False
+    return "tool_choice.name" in response.text and "missing" in response.text.lower()
+
+
+def convert_chat_message_to_response_output(message: Dict[str, Any], output_index: int) -> List[Dict[str, Any]]:
+    """Convert one completed Chat assistant message to Responses output items."""
+    output: List[Dict[str, Any]] = []
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        output.append(
+            {
+                "id": f"rs_{uuid.uuid4().hex[:24]}",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning_content}],
+            }
+        )
+
+    content = message.get("content")
+    refusal = message.get("refusal")
+    if content is not None or refusal:
+        content_parts: List[Dict[str, Any]] = []
+        if isinstance(content, str):
+            content_parts.append({"type": "output_text", "text": content, "annotations": []})
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in {"text", "output_text"}:
+                    content_parts.append({"type": "output_text", "text": part.get("text", ""), "annotations": []})
+                elif isinstance(part, dict):
+                    content_parts.append(part)
+        elif content:
+            content_parts.append({"type": "output_text", "text": serialize_content_as_text(content), "annotations": []})
+        if refusal:
+            content_parts.append({"type": "refusal", "refusal": refusal})
+        output.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": content_parts,
+            }
+        )
+
+    for tool_call in message.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") or {}
+        arguments = function.get("arguments", "{}")
+        output.append(
+            {
+                "id": f"fc_{uuid.uuid4().hex[:24]}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "name": function.get("name", ""),
+                "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False),
+            }
+        )
+    return output
+
+
+def convert_chat_to_response_payload(chat_response: Dict[str, Any], requested_model: str) -> Dict[str, Any]:
+    """Convert a non-stream Chat Completions result to a Responses object."""
+    output: List[Dict[str, Any]] = []
+    finish_reasons: List[str] = []
+    for choice in chat_response.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict):
+            output.extend(convert_chat_message_to_response_output(message, choice.get("index", len(output))))
+        finish_reason = choice.get("finish_reason")
+        if isinstance(finish_reason, str):
+            finish_reasons.append(finish_reason)
+
+    status = "incomplete" if "length" in finish_reasons else "completed"
+    response_payload: Dict[str, Any] = {
+        "id": f"resp_{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "created_at": int(chat_response.get("created") or time.time()),
+        "status": status,
+        "model": chat_response.get("model") or requested_model,
+        "output": output,
+        "parallel_tool_calls": True,
+    }
+    if status == "incomplete":
+        response_payload["incomplete_details"] = {"reason": "max_output_tokens"}
+    usage = convert_chat_usage_to_response_usage(chat_response.get("usage"))
+    if usage is not None:
+        response_payload["usage"] = usage
+    return response_payload
+
+
 def generate_chat_id() -> str:
     """生成 Chat Completion ID"""
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -653,6 +976,258 @@ class ResponseStreamProcessor:
         }
 
 
+def create_response_sse_event(event_type: str, data: Dict[str, Any]) -> str:
+    """Format one OpenAI Responses SSE event."""
+    payload = dict(data)
+    payload.setdefault("type", event_type)
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+class ChatStreamToResponseProcessor:
+    """Turn Chat Completions SSE deltas into OpenAI Responses SSE events."""
+
+    def __init__(self, model: str):
+        self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        self.model = model
+        self.created_at = int(time.time())
+        self.output_items: List[Dict[str, Any]] = []
+        self.message_items: Dict[int, Dict[str, Any]] = {}
+        self.tool_items: Dict[tuple[int, int], Dict[str, Any]] = {}
+        self.usage: Optional[Dict[str, Any]] = None
+        self.finish_reasons: List[str] = []
+        self.created_emitted = False
+
+    def _response_snapshot(self, status: str = "in_progress") -> Dict[str, Any]:
+        response: Dict[str, Any] = {
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "model": self.model,
+            "output": [self._public_item(item) for item in self.output_items],
+            "parallel_tool_calls": True,
+        }
+        usage = convert_chat_usage_to_response_usage(self.usage)
+        if usage is not None:
+            response["usage"] = usage
+        if status == "incomplete":
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+        return response
+
+    def start_events(self) -> List[str]:
+        if self.created_emitted:
+            return []
+        self.created_emitted = True
+        return [
+            create_response_sse_event(
+                "response.created",
+                {"response": self._response_snapshot()},
+            )
+        ]
+
+    def _ensure_message(self, choice_index: int) -> tuple[Dict[str, Any], List[str]]:
+        existing = self.message_items.get(choice_index)
+        if existing is not None:
+            return existing, []
+
+        item = {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+            "_output_index": len(self.output_items),
+            "_content_started": False,
+            "_text": "",
+        }
+        self.message_items[choice_index] = item
+        self.output_items.append(item)
+        return item, [
+            create_response_sse_event(
+                "response.output_item.added",
+                {
+                    "output_index": item["_output_index"],
+                    "item": self._public_item(item),
+                },
+            )
+        ]
+
+    def _ensure_message_content_part(self, item: Dict[str, Any]) -> List[str]:
+        if item["_content_started"]:
+            return []
+        item["_content_started"] = True
+        part = {"type": "output_text", "text": "", "annotations": []}
+        item["content"].append(part)
+        return [
+            create_response_sse_event(
+                "response.content_part.added",
+                {
+                    "item_id": item["id"],
+                    "output_index": item["_output_index"],
+                    "content_index": 0,
+                    "part": part,
+                },
+            )
+        ]
+
+    def _ensure_tool(self, choice_index: int, tool_index: int, delta: Dict[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+        key = (choice_index, tool_index)
+        existing = self.tool_items.get(key)
+        if existing is not None:
+            return existing, []
+
+        function = delta.get("function") if isinstance(delta.get("function"), dict) else {}
+        item = {
+            "id": f"fc_{uuid.uuid4().hex[:24]}",
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": delta.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "name": function.get("name", ""),
+            "arguments": "",
+            "_output_index": len(self.output_items),
+        }
+        self.tool_items[key] = item
+        self.output_items.append(item)
+        return item, [
+            create_response_sse_event(
+                "response.output_item.added",
+                {
+                    "output_index": item["_output_index"],
+                    "item": self._public_item(item),
+                },
+            )
+        ]
+
+    @staticmethod
+    def _public_item(item: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in item.items() if not key.startswith("_")}
+
+    def process_chunk(self, chunk: Dict[str, Any]) -> List[str]:
+        events = self.start_events()
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            self.usage = usage
+
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            choice_index = int(choice.get("index", 0))
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+
+            content = delta.get("content")
+            if content is not None:
+                item, item_events = self._ensure_message(choice_index)
+                events.extend(item_events)
+                events.extend(self._ensure_message_content_part(item))
+                if content:
+                    item["_text"] += content
+                    item["content"][0]["text"] = item["_text"]
+                    events.append(
+                        create_response_sse_event(
+                            "response.output_text.delta",
+                            {
+                                "item_id": item["id"],
+                                "output_index": item["_output_index"],
+                                "content_index": 0,
+                                "delta": content,
+                            },
+                        )
+                    )
+
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for fallback_index, tool_delta in enumerate(tool_calls):
+                    if not isinstance(tool_delta, dict):
+                        continue
+                    tool_index = int(tool_delta.get("index", fallback_index))
+                    item, item_events = self._ensure_tool(choice_index, tool_index, tool_delta)
+                    events.extend(item_events)
+                    function = tool_delta.get("function") if isinstance(tool_delta.get("function"), dict) else {}
+                    if function.get("name"):
+                        item["name"] = function["name"]
+                    arguments_delta = function.get("arguments")
+                    if arguments_delta:
+                        item["arguments"] += arguments_delta
+                        events.append(
+                            create_response_sse_event(
+                                "response.function_call_arguments.delta",
+                                {
+                                    "item_id": item["id"],
+                                    "output_index": item["_output_index"],
+                                    "delta": arguments_delta,
+                                },
+                            )
+                        )
+
+            finish_reason = choice.get("finish_reason")
+            if isinstance(finish_reason, str):
+                self.finish_reasons.append(finish_reason)
+        return events
+
+    def final_events(self) -> List[str]:
+        events = self.start_events()
+        for item in self.output_items:
+            output_index = item["_output_index"]
+            if item["type"] == "message":
+                if item["_content_started"]:
+                    part = item["content"][0]
+                    events.append(
+                        create_response_sse_event(
+                            "response.output_text.done",
+                            {
+                                "item_id": item["id"],
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "text": part["text"],
+                            },
+                        )
+                    )
+                    events.append(
+                        create_response_sse_event(
+                            "response.content_part.done",
+                            {
+                                "item_id": item["id"],
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "part": part,
+                            },
+                        )
+                    )
+                item["status"] = "completed"
+            elif item["type"] == "function_call":
+                item["status"] = "completed"
+                events.append(
+                    create_response_sse_event(
+                        "response.function_call_arguments.done",
+                        {
+                            "item_id": item["id"],
+                            "output_index": output_index,
+                            "arguments": item["arguments"],
+                        },
+                    )
+                )
+            events.append(
+                create_response_sse_event(
+                    "response.output_item.done",
+                    {
+                        "output_index": output_index,
+                        "item": self._public_item(item),
+                    },
+                )
+            )
+
+        status = "incomplete" if "length" in self.finish_reasons else "completed"
+        events.append(
+            create_response_sse_event(
+                "response.completed",
+                {"response": self._response_snapshot(status)},
+            )
+        )
+        return events
+
+
 async def parse_sse_line(line: str) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
     """解析 SSE 行，返回 (event_type, event_data)"""
     if not line or line.startswith(":"):
@@ -759,6 +1334,11 @@ def render_dashboard_page(
             toggle_target = "0" if channel["enabled"] else "1"
             state_class = "pill-enabled" if channel["enabled"] else "pill-disabled"
             state_text = "启用中" if channel["enabled"] else "已停用"
+            protocol_type_label = (
+                "Chat → Responses"
+                if channel.get("protocol_type") == CHANNEL_TYPE_CHAT_TO_RESPONSE
+                else "Responses → Chat"
+            )
             description = escape(channel["description"] or "未填写描述")
             channel_cards.append(
                 render_html_template(
@@ -769,6 +1349,7 @@ def render_dashboard_page(
                     state_text=state_text,
                     upstream_base_url=escape(channel["upstream_base_url"]),
                     upstream_api_key_masked=escape(mask_secret(channel["upstream_api_key"])),
+                    protocol_type_label=protocol_type_label,
                     access_key=escape(channel["access_key"]),
                     updated_at=escape(format_admin_time(channel["updated_at"])),
                     channel_id=channel["id"],
@@ -805,6 +1386,12 @@ def render_channel_detail_page(
         enabled_checked=checked,
         access_key=escape(channel["access_key"]),
         upstream_api_key_masked=escape(mask_secret(channel["upstream_api_key"])),
+        response_to_chat_selected=(
+            "selected" if channel.get("protocol_type") != CHANNEL_TYPE_CHAT_TO_RESPONSE else ""
+        ),
+        chat_to_response_selected=(
+            "selected" if channel.get("protocol_type") == CHANNEL_TYPE_CHAT_TO_RESPONSE else ""
+        ),
         created_at=escape(format_admin_time(channel["created_at"])),
         updated_at=escape(format_admin_time(channel["updated_at"])),
     )
@@ -1075,6 +1662,259 @@ def summarize_upstream_response(response: httpx.Response) -> str:
     return ""
 
 
+async def handle_chat_to_response_stream(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+    request_body: Dict[str, Any],
+    model: str,
+) -> Response:
+    """Call a Chat upstream as SSE and expose an equivalent Responses stream."""
+    processor = ChatStreamToResponseProcessor(model)
+    start_time = time.monotonic()
+    stream_context = client.stream(
+        "POST",
+        url,
+        headers=headers,
+        json=request_body,
+        timeout=httpx.Timeout(
+            connect=30.0,
+            read=STREAM_READ_TIMEOUT,
+            write=30.0,
+            pool=POOL_TIMEOUT,
+        ),
+    )
+    upstream_response: Optional[httpx.Response] = None
+    close_stream_context = True
+    fallback_request_body = build_flat_tool_choice_fallback(request_body)
+
+    try:
+        upstream_response = await stream_context.__aenter__()
+        if not upstream_response.is_success:
+            error_body = await upstream_response.aread()
+            if fallback_request_body and upstream_requires_flat_tool_choice(upstream_response):
+                logger.info("Retrying Chat stream with flat tool_choice.name compatibility format")
+                await stream_context.__aexit__(None, None, None)
+                stream_context = client.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=fallback_request_body,
+                    timeout=httpx.Timeout(
+                        connect=30.0,
+                        read=STREAM_READ_TIMEOUT,
+                        write=30.0,
+                        pool=POOL_TIMEOUT,
+                    ),
+                )
+                upstream_response = await stream_context.__aenter__()
+                if not upstream_response.is_success:
+                    error_body = await upstream_response.aread()
+                    return build_upstream_error_response(
+                        upstream_response.status_code,
+                        error_body.decode("utf-8", errors="ignore"),
+                    )
+                close_stream_context = False
+            else:
+                return build_upstream_error_response(
+                    upstream_response.status_code,
+                    error_body.decode("utf-8", errors="ignore"),
+                )
+        else:
+            close_stream_context = False
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"error": {"message": "Request timeout", "type": "timeout_error"}},
+        )
+    except Exception as exc:
+        logger.error("Chat to Responses stream initialization failed: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(exc), "type": "internal_error"}},
+        )
+    finally:
+        if close_stream_context:
+            await stream_context.__aexit__(None, None, None)
+
+    async def stream_generator():
+        emitted_final_events = False
+        try:
+            initial_events = processor.start_events()
+            for event in initial_events:
+                yield event
+
+            async for line in upstream_response.aiter_lines():
+                if STREAM_MAX_DURATION > 0 and (time.monotonic() - start_time) > STREAM_MAX_DURATION:
+                    yield create_response_sse_event(
+                        "error",
+                        {"message": "Stream max duration exceeded", "code": "timeout_error"},
+                    )
+                    return
+                line = line.strip()
+                if not line or line.startswith("event:"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    for event in processor.final_events():
+                        yield event
+                    emitted_final_events = True
+                    return
+                try:
+                    event_data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    logger.warning("Invalid JSON in upstream Chat SSE: %s", data_str[:200])
+                    continue
+
+                upstream_error = event_data.get("error") if isinstance(event_data, dict) else None
+                if isinstance(upstream_error, dict):
+                    yield create_response_sse_event("error", upstream_error)
+                    return
+                if isinstance(event_data, dict):
+                    for event in processor.process_chunk(event_data):
+                        yield event
+
+            for event in processor.final_events():
+                yield event
+            emitted_final_events = True
+        except asyncio.CancelledError:
+            logger.warning("Chat to Responses stream cancelled by client")
+            raise
+        except httpx.TimeoutException:
+            yield create_response_sse_event(
+                "error",
+                {"message": "Request timeout", "code": "timeout_error"},
+            )
+        except Exception as exc:
+            logger.error("Chat to Responses stream failed: %s", exc, exc_info=True)
+            yield create_response_sse_event(
+                "error",
+                {"message": str(exc), "code": "internal_error"},
+            )
+        finally:
+            if not emitted_final_events:
+                logger.debug("Chat to Responses stream ended without a completion event")
+            await stream_context.__aexit__(None, None, None)
+
+    return StreamingResponse(
+        stream_generator(),
+        status_code=upstream_response.status_code,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def handle_response_to_chat_conversion(
+    request: Request,
+    channel: Dict[str, Any],
+) -> Response:
+    """Expose /v1/responses by converting it to an upstream Chat request."""
+    try:
+        response_request = await request.json()
+    except json.JSONDecodeError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": f"Invalid JSON: {exc}", "type": "invalid_request_error"}},
+        )
+
+    if not isinstance(response_request, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "Request body must be a JSON object", "type": "invalid_request_error"}},
+        )
+
+    try:
+        chat_request = convert_response_to_chat_request(response_request)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": str(exc), "type": "invalid_request_error"}},
+        )
+
+    client: httpx.AsyncClient = request.app.state.http_client
+    is_stream_request = bool(chat_request["stream"])
+    headers = build_channel_upstream_headers(
+        channel,
+        {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if is_stream_request else "application/json",
+        },
+    )
+    upstream_url = f"{channel['upstream_base_url']}/chat/completions"
+    logger.debug(
+        "Converted /v1/responses -> %s: model=%s, stream=%s, messages=%d",
+        upstream_url,
+        chat_request["model"],
+        is_stream_request,
+        len(chat_request["messages"]),
+    )
+
+    if is_stream_request:
+        return await handle_chat_to_response_stream(
+            client,
+            upstream_url,
+            headers,
+            chat_request,
+            chat_request["model"],
+        )
+
+    try:
+        upstream_response = await client.post(
+            upstream_url,
+            headers=headers,
+            json=chat_request,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        fallback_request = build_flat_tool_choice_fallback(chat_request)
+        if fallback_request and upstream_requires_flat_tool_choice(upstream_response):
+            logger.info("Retrying Chat request with flat tool_choice.name compatibility format")
+            upstream_response = await client.post(
+                upstream_url,
+                headers=headers,
+                json=fallback_request,
+                timeout=DEFAULT_TIMEOUT,
+            )
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"error": {"message": "Request timeout", "type": "timeout_error"}},
+        )
+    except httpx.HTTPError as exc:
+        logger.error("Chat to Responses non-stream request failed: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": str(exc), "type": "upstream_error"}},
+        )
+
+    if not upstream_response.is_success:
+        return build_upstream_error_response(upstream_response.status_code, upstream_response.text)
+    try:
+        chat_response = upstream_response.json()
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": "Upstream Chat response is not valid JSON",
+                    "type": "upstream_error",
+                }
+            },
+        )
+    if not isinstance(chat_response, dict):
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": "Upstream Chat response is invalid", "type": "upstream_error"}},
+        )
+    return JSONResponse(content=convert_chat_to_response_payload(chat_response, chat_request["model"]))
+
+
 @app.get("/")
 async def root_redirect():
     return RedirectResponse(url="/admin", status_code=303)
@@ -1199,6 +2039,7 @@ async def admin_create_channel(request: Request):
             form.get("upstream_base_url", ""),
             form.get("upstream_api_key", ""),
             form.get("description", ""),
+            form.get("protocol_type", CHANNEL_TYPE_RESPONSE_TO_CHAT),
         )
         return build_admin_redirect(
             "/admin",
@@ -1228,6 +2069,7 @@ async def admin_update_channel(request: Request, channel_id: int):
             form.get("description", ""),
             form.get("enabled") == "on",
             form.get("clear_upstream_api_key") == "on",
+            form.get("protocol_type", CHANNEL_TYPE_RESPONSE_TO_CHAT),
         )
         if not channel:
             return build_admin_redirect("/admin", "渠道不存在", "error")
@@ -1267,14 +2109,23 @@ async def admin_test_channel(request: Request, channel_id: int):
         )
 
     client: httpx.AsyncClient = request.app.state.http_client
-    test_payload = {
-        "model": ADMIN_TEST_MODEL,
-        "input": ADMIN_TEST_INPUT,
-        "stream": False,
-    }
+    if channel.get("protocol_type") == CHANNEL_TYPE_CHAT_TO_RESPONSE:
+        test_endpoint = "/chat/completions"
+        test_payload = {
+            "model": ADMIN_TEST_MODEL,
+            "messages": [{"role": "user", "content": ADMIN_TEST_INPUT}],
+            "stream": False,
+        }
+    else:
+        test_endpoint = "/responses"
+        test_payload = {
+            "model": ADMIN_TEST_MODEL,
+            "input": ADMIN_TEST_INPUT,
+            "stream": False,
+        }
     try:
         response = await client.post(
-            f"{channel['upstream_base_url']}/responses",
+            f"{channel['upstream_base_url']}{test_endpoint}",
             headers=build_channel_upstream_headers(
                 channel,
                 {
@@ -1316,7 +2167,7 @@ async def admin_test_channel(request: Request, channel_id: int):
     if response.status_code in (401, 403):
         failure_reason = f"HTTP {response.status_code}，上游鉴权失败"
     elif response.status_code == 404:
-        failure_reason = "HTTP 404，上游未提供 /responses 接口"
+        failure_reason = f"HTTP 404，上游未提供 {test_endpoint} 接口"
     if summary:
         failure_reason = f"{failure_reason}，{summary}"
     return build_admin_feedback_response(
@@ -1407,9 +2258,12 @@ async def responses_passthrough(
     request: Request,
     authorization: Optional[str] = Header(None)
 ):
-    """Responses endpoint passthrough without request/response conversion."""
+    """Responses passthrough, or Responses -> Chat for reverse-mode channels."""
     channel = await resolve_channel_from_request(request, authorization)
     logger.debug("/v1/responses 命中渠道: id=%s, name=%s", channel["id"], channel["name"])
+
+    if channel.get("protocol_type") == CHANNEL_TYPE_CHAT_TO_RESPONSE:
+        return await handle_response_to_chat_conversion(request, channel)
 
     raw_body = await request.body()
     is_stream_request = "text/event-stream" in request.headers.get("accept", "").lower()
@@ -1538,6 +2392,17 @@ async def chat_completions(
 
     channel = await resolve_channel_from_request(request, authorization)
     logger.debug("/v1/chat/completions 命中渠道: id=%s, name=%s", channel["id"], channel["name"])
+
+    if channel.get("protocol_type") == CHANNEL_TYPE_CHAT_TO_RESPONSE:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "This channel is configured for Chat to Responses conversion; use /v1/responses.",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
     
     # 解析请求体
     try:
