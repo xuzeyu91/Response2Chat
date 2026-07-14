@@ -33,11 +33,13 @@ TEMPLATE_DIR = BASE_DIR / "templates"
 
 # ==================== 日志配置 ====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+HTTPX_LOG_LEVEL = os.getenv("HTTPX_LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("response2chat")
+logging.getLogger("httpx").setLevel(getattr(logging, HTTPX_LOG_LEVEL, logging.WARNING))
 
 # ==================== 配置 ====================
 DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "300"))
@@ -872,7 +874,7 @@ def normalize_next_path(next_path: Optional[str]) -> str:
 async def resolve_channel_from_request(request: Request, authorization: Optional[str]) -> Dict[str, Any]:
     access_key = extract_bearer_token(authorization)
     store: SettingsStore = request.app.state.settings_store
-    channel = await asyncio.to_thread(store.get_channel_by_access_key, access_key)
+    channel = store.get_channel_by_access_key(access_key)
 
     if not channel:
         logger.warning("无效的渠道访问 key")
@@ -1407,7 +1409,7 @@ async def responses_passthrough(
 ):
     """Responses endpoint passthrough without request/response conversion."""
     channel = await resolve_channel_from_request(request, authorization)
-    logger.info(f"/v1/responses 命中渠道: id={channel['id']}, name={channel['name']}")
+    logger.debug("/v1/responses 命中渠道: id=%s, name=%s", channel["id"], channel["name"])
 
     raw_body = await request.body()
     is_stream_request = "text/event-stream" in request.headers.get("accept", "").lower()
@@ -1416,11 +1418,15 @@ async def responses_passthrough(
         try:
             request_json = json.loads(raw_body)
             is_stream_request = bool(request_json.get("stream")) or is_stream_request
-            logger.info(f"Received /v1/responses request: {json.dumps(request_json, ensure_ascii=False, indent=2)}")
+            logger.debug(
+                "Received /v1/responses request: stream=%s, body_bytes=%d",
+                is_stream_request,
+                len(raw_body),
+            )
         except json.JSONDecodeError:
-            logger.info("Received /v1/responses request: <non-json body>")
+            logger.debug("Received /v1/responses request: <non-json body>")
     else:
-        logger.info("Received /v1/responses request: <empty body>")
+        logger.debug("Received /v1/responses request: <empty body>")
 
     client: httpx.AsyncClient = request.app.state.http_client
     upstream_url = f"{channel['upstream_base_url']}/responses"
@@ -1433,7 +1439,7 @@ async def responses_passthrough(
         pool=POOL_TIMEOUT
     )
 
-    logger.info(f"Passthrough /v1/responses -> {upstream_url}, stream={is_stream_request}")
+    logger.debug("Passthrough /v1/responses -> %s, stream=%s", upstream_url, is_stream_request)
 
     if is_stream_request:
         stream_context = client.stream(
@@ -1448,7 +1454,7 @@ async def responses_passthrough(
 
         try:
             upstream_response = await stream_context.__aenter__()
-            logger.info(f"Upstream /responses stream status: {upstream_response.status_code}")
+            logger.debug("Upstream /responses stream status: %s", upstream_response.status_code)
             response_headers = build_passthrough_response_headers(upstream_response.headers)
 
             async def stream_generator():
@@ -1493,7 +1499,7 @@ async def responses_passthrough(
             content=raw_body,
             timeout=DEFAULT_TIMEOUT
         )
-        logger.info(f"Upstream /responses non-stream status: {upstream_response.status_code}")
+        logger.debug("Upstream /responses non-stream status: %s", upstream_response.status_code)
         return Response(
             content=upstream_response.content,
             status_code=upstream_response.status_code,
@@ -1531,14 +1537,18 @@ async def chat_completions(
     """Chat Completions 接口 - 转发到 Response API"""
 
     channel = await resolve_channel_from_request(request, authorization)
-    logger.info(f"/v1/chat/completions 命中渠道: id={channel['id']}, name={channel['name']}")
+    logger.debug("/v1/chat/completions 命中渠道: id=%s, name=%s", channel["id"], channel["name"])
     
     # 解析请求体
     try:
         body = await request.json()
-        logger.info(f"收到请求: {json.dumps(body, ensure_ascii=False, indent=2)}")
         chat_request = ChatCompletionRequest(**body)
-        logger.debug(f"解析后的请求: model={chat_request.model}, stream={chat_request.stream}, messages_count={len(chat_request.messages)}")
+        logger.debug(
+            "Received /v1/chat/completions request: model=%s, stream=%s, messages=%d",
+            chat_request.model,
+            chat_request.stream,
+            len(chat_request.messages),
+        )
     except json.JSONDecodeError as e:
         logger.error(f"JSON 解析失败: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
@@ -1548,7 +1558,12 @@ async def chat_completions(
     
     # 转换为 Response API 请求
     response_request = convert_chat_to_response_request(chat_request)
-    logger.info(f"转换后的 Response API 请求: {json.dumps(response_request, ensure_ascii=False, indent=2)}")
+    logger.debug(
+        "Converted Response API request: model=%s, input_items=%d, stream=%s",
+        response_request["model"],
+        len(response_request["input"]),
+        response_request["stream"],
+    )
     
     # 生成 Chat ID
     chat_id = generate_chat_id()
@@ -1568,11 +1583,11 @@ async def chat_completions(
     
     # Response API URL
     response_url = f"{channel['upstream_base_url']}/responses"
-    logger.info(f"转发到: {response_url}")
+    logger.debug("转发到: %s", response_url)
     
     if chat_request.stream:
         # 流式模式：直接转发 SSE
-        logger.info("使用流式模式处理请求")
+        logger.debug("使用流式模式处理请求")
         return await handle_stream_response(
             client, response_url, headers, response_request,
             chat_id, chat_request.model,
@@ -1580,7 +1595,7 @@ async def chat_completions(
         )
     else:
         # 非流式模式：收集完整响应后返回
-        logger.info("使用非流式模式处理请求")
+        logger.debug("使用非流式模式处理请求")
         return await handle_non_stream_response(
             client, response_url, headers, response_request,
             chat_id, chat_request.model
@@ -1619,7 +1634,7 @@ async def handle_stream_response(
     try:
         logger.debug(f"开始流式请求到 {url}")
         upstream_response = await stream_context.__aenter__()
-        logger.info(f"上游响应状态码: {upstream_response.status_code}")
+        logger.debug("上游响应状态码: %s", upstream_response.status_code)
         logger.debug(f"上游响应头: {dict(upstream_response.headers)}")
 
         if upstream_response.status_code != 200:
@@ -1685,8 +1700,14 @@ async def handle_stream_response(
                 elif line.startswith("data:"):
                     data_str = line[5:].strip()
                     if data_str == "[DONE]":
-                        final_response = processor.get_accumulated_response()
-                        logger.info(f"流式响应完成: {json.dumps(final_response, ensure_ascii=False)}")
+                        logger.debug(
+                            "流式响应完成: chat_id=%s, model=%s, content_chars=%d, reasoning_chars=%d, tool_calls=%d",
+                            chat_id,
+                            model,
+                            len(processor.accumulated_content),
+                            len(processor.accumulated_reasoning),
+                            len(processor.tool_calls),
+                        )
                         for chunk in processor.get_final_chunks():
                             yield chunk
                         return
@@ -1727,8 +1748,14 @@ async def handle_stream_response(
                         logger.warning(f"JSON 解析失败: {e}, 原始数据: {data_str[:100]}")
                         continue
 
-            final_response = processor.get_accumulated_response()
-            logger.info(f"流结束: {json.dumps(final_response, ensure_ascii=False)}")
+            logger.debug(
+                "流结束: chat_id=%s, model=%s, content_chars=%d, reasoning_chars=%d, tool_calls=%d",
+                chat_id,
+                model,
+                len(processor.accumulated_content),
+                len(processor.accumulated_reasoning),
+                len(processor.tool_calls),
+            )
             for chunk in processor.get_final_chunks():
                 yield chunk
 
@@ -1812,7 +1839,7 @@ async def handle_non_stream_response(
             json=request_body,
             timeout=DEFAULT_TIMEOUT
         ) as response:
-            logger.info(f"上游响应状态码: {response.status_code}")
+            logger.debug("上游响应状态码: %s", response.status_code)
             logger.debug(f"上游响应头: {dict(response.headers)}")
             
             if response.status_code != 200:
@@ -1874,7 +1901,7 @@ async def handle_non_stream_response(
                 elif line.startswith("data:"):
                     data_str = line[5:].strip()
                     if data_str == "[DONE]":
-                        logger.info("收到 [DONE] 信号")
+                        logger.debug("收到 [DONE] 信号")
                         break
                     
                     try:
@@ -1915,7 +1942,14 @@ async def handle_non_stream_response(
         
         # 返回累积的完整响应
         result = processor.get_accumulated_response()
-        logger.info(f"返回完整响应: {json.dumps(result, ensure_ascii=False)}")
+        logger.debug(
+            "返回完整响应: chat_id=%s, model=%s, content_chars=%d, reasoning_chars=%d, tool_calls=%d",
+            chat_id,
+            model,
+            len(processor.accumulated_content),
+            len(processor.accumulated_reasoning),
+            len(processor.tool_calls),
+        )
         return JSONResponse(content=result)
         
     except httpx.TimeoutException:

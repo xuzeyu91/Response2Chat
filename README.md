@@ -253,6 +253,7 @@ curl -H "Authorization: Bearer CHANNEL_ACCESS_KEY" http://localhost:8000/v1/mode
 | `ADMIN_COOKIE_SECURE` | 否 | 是否仅通过 HTTPS 下发管理后台 Cookie | `false` |
 | `HOST` | 否 | 服务监听地址 | `0.0.0.0` |
 | `PORT` | 否 | 服务监听端口 | `8000` |
+| `HTTPX_LOG_LEVEL` | 否 | 上游 HTTP 客户端日志级别；高并发下建议保持 `WARNING` | `WARNING` |
 | `DEFAULT_TIMEOUT` | 否 | 普通请求读取超时（秒） | `300` |
 | `POOL_TIMEOUT` | 否 | 从连接池获取连接的超时（秒） | `10` |
 | `STREAM_READ_TIMEOUT` | 否 | 流式读取超时（秒） | `120` |

@@ -92,6 +92,9 @@ class SettingsStore:
         self.database_path = Path(database_path)
         self.default_admin_username = default_admin_username.strip() or "admin"
         self.default_admin_password = default_admin_password or "admin123456"
+        self._channel_cache: Dict[str, Dict[str, Any]] = {}
+        self._channel_cache_initialized = False
+        self._channel_cache_lock = Lock()
 
     def initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +130,7 @@ class SettingsStore:
             conn.commit()
 
         self._ensure_default_admin()
+        self._reload_channel_cache()
 
     def _connect(self) -> _ManagedConnection:
         conn = sqlite3.connect(str(self.database_path), check_same_thread=False)
@@ -232,19 +236,16 @@ class SettingsStore:
         if not access_key:
             return None
 
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, name, description, upstream_base_url, upstream_api_key,
-                       access_key, enabled, created_at, updated_at
-                FROM channels
-                WHERE access_key = ?
-                LIMIT 1
-                """,
-                (access_key,),
-            ).fetchone()
+        with self._channel_cache_lock:
+            cache_initialized = self._channel_cache_initialized
+            channel = self._channel_cache.get(access_key)
 
-        return self._row_to_channel(row) if row else None
+        if not cache_initialized:
+            self._reload_channel_cache()
+            with self._channel_cache_lock:
+                channel = self._channel_cache.get(access_key)
+
+        return dict(channel) if channel else None
 
     def create_channel(
         self,
@@ -292,6 +293,7 @@ class SettingsStore:
         if not channel:
             raise RuntimeError("渠道创建失败，保存后未能读取配置")
 
+        self._cache_channel(channel)
         return channel
 
     def update_channel(
@@ -346,7 +348,10 @@ class SettingsStore:
             except sqlite3.IntegrityError as exc:
                 raise ValueError("渠道名称已存在，请更换后重试") from exc
 
-        return self.get_channel(channel_id)
+        channel = self.get_channel(channel_id)
+        if channel:
+            self._cache_channel(channel)
+        return channel
 
     def set_channel_enabled(self, channel_id: int, enabled: bool) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -356,7 +361,10 @@ class SettingsStore:
             )
             conn.commit()
 
-        return self.get_channel(channel_id)
+        channel = self.get_channel(channel_id)
+        if channel:
+            self._cache_channel(channel)
+        return channel
 
     def rotate_access_key(self, channel_id: int) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -370,15 +378,61 @@ class SettingsStore:
             )
             conn.commit()
 
-        return self.get_channel(channel_id)
+        channel = self.get_channel(channel_id)
+        if channel:
+            self._cache_channel(channel)
+        return channel
 
     def delete_channel(self, channel_id: int) -> bool:
         with self._connect() as conn:
             cursor = conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
             conn.commit()
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
 
-        return False
+        if deleted:
+            self._remove_channel_from_cache(channel_id)
+        return deleted
+
+    def _reload_channel_cache(self) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, description, upstream_base_url, upstream_api_key,
+                       access_key, enabled, created_at, updated_at
+                FROM channels
+                """
+            ).fetchall()
+
+        channels = [self._row_to_channel(row) for row in rows]
+        with self._channel_cache_lock:
+            self._channel_cache = {
+                channel["access_key"]: channel
+                for channel in channels
+            }
+            self._channel_cache_initialized = True
+
+    def _cache_channel(self, channel: Dict[str, Any]) -> None:
+        cached_channel = dict(channel)
+        with self._channel_cache_lock:
+            stale_keys = [
+                access_key
+                for access_key, cached in self._channel_cache.items()
+                if cached["id"] == cached_channel["id"]
+            ]
+            for access_key in stale_keys:
+                self._channel_cache.pop(access_key, None)
+            self._channel_cache[cached_channel["access_key"]] = cached_channel
+            self._channel_cache_initialized = True
+
+    def _remove_channel_from_cache(self, channel_id: int) -> None:
+        with self._channel_cache_lock:
+            stale_keys = [
+                access_key
+                for access_key, cached in self._channel_cache.items()
+                if cached["id"] == channel_id
+            ]
+            for access_key in stale_keys:
+                self._channel_cache.pop(access_key, None)
 
     def _generate_unique_access_key(self, conn: sqlite3.Connection) -> str:
         while True:
