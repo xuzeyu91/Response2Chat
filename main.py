@@ -824,8 +824,65 @@ class ResponseStreamProcessor:
         self.usage = None
         self.is_first_content = True
         self.current_output_index = None
-        self.tool_calls = []
-        self.current_tool_call = None
+        # A Responses stream can interleave several function calls. Chat
+        # clients need each call's id/type/name before any arguments delta.
+        self.tool_calls: List[Dict[str, Any]] = []
+        self._tool_calls_by_item_id: Dict[str, Dict[str, Any]] = {}
+        self._tool_calls_by_output_index: Dict[int, Dict[str, Any]] = {}
+
+    def _lookup_tool_call(self, event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Locate a streamed function call by item id, then output index."""
+        item_id = event_data.get("item_id")
+        if isinstance(item_id, str) and item_id:
+            tool_call = self._tool_calls_by_item_id.get(item_id)
+            if tool_call is not None:
+                return tool_call
+
+        output_index = event_data.get("output_index")
+        if isinstance(output_index, int):
+            return self._tool_calls_by_output_index.get(output_index)
+        return None
+
+    def _tool_call_index(self, tool_call: Dict[str, Any]) -> int:
+        return self.tool_calls.index(tool_call)
+
+    def _emit_tool_arguments_delta(self, tool_call: Dict[str, Any], arguments_delta: str) -> List[str]:
+        """Append and expose one Responses arguments delta in Chat format."""
+        if not arguments_delta:
+            return []
+        tool_call["function"]["arguments"] += arguments_delta
+        return [
+            create_chat_stream_chunk(
+                self.chat_id,
+                self.model,
+                {
+                    "tool_calls": [
+                        {
+                            "index": self._tool_call_index(tool_call),
+                            "function": {"arguments": arguments_delta},
+                        }
+                    ]
+                },
+            )
+        ]
+
+    def _complete_tool_arguments(self, tool_call: Dict[str, Any], final_arguments: Any) -> List[str]:
+        """Fill final arguments when an upstream omits one or more deltas."""
+        if not isinstance(final_arguments, str):
+            return []
+
+        streamed_arguments = tool_call["function"]["arguments"]
+        if final_arguments.startswith(streamed_arguments):
+            return self._emit_tool_arguments_delta(tool_call, final_arguments[len(streamed_arguments):])
+
+        if final_arguments != streamed_arguments:
+            logger.warning(
+                "Responses function-call arguments were not a continuation; "
+                "the accumulated response is corrected but already-sent Chat "
+                "deltas cannot be replaced"
+            )
+            tool_call["function"]["arguments"] = final_arguments
+        return []
     
     def process_event(self, event_type: str, event_data: Dict[str, Any]) -> List[str]:
         """处理单个 SSE 事件，返回要发送的 Chat chunks"""
@@ -842,16 +899,42 @@ class ResponseStreamProcessor:
             # 新的输出项开始
             item = event_data.get("item", {})
             self.current_output_index = event_data.get("output_index", 0)
-            if item.get("type") == "function_call":
+            if isinstance(item, dict) and item.get("type") == "function_call":
                 # 工具调用开始
-                self.current_tool_call = {
-                    "id": item.get("call_id", f"call_{uuid.uuid4().hex[:8]}"),
+                tool_call = {
+                    "id": item.get("call_id", f"call_{uuid.uuid4().hex[:24]}"),
                     "type": "function",
                     "function": {
                         "name": item.get("name", ""),
-                        "arguments": ""
-                    }
+                        "arguments": "",
+                    },
                 }
+                self.tool_calls.append(tool_call)
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    self._tool_calls_by_item_id[item_id] = tool_call
+                if isinstance(self.current_output_index, int):
+                    self._tool_calls_by_output_index[self.current_output_index] = tool_call
+
+                chunks.append(
+                    create_chat_stream_chunk(
+                        self.chat_id,
+                        self.model,
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": self._tool_call_index(tool_call),
+                                    "id": tool_call["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_call["function"]["name"],
+                                        "arguments": "",
+                                    },
+                                }
+                            ]
+                        },
+                    )
+                )
         
         elif event_type == "response.output_text.delta":
             # 文本增量
@@ -887,31 +970,30 @@ class ResponseStreamProcessor:
                 ))
         
         elif event_type == "response.function_call_arguments.delta":
-            # 函数调用参数增量
             delta_args = event_data.get("delta", "")
-            if self.current_tool_call and delta_args:
-                self.current_tool_call["function"]["arguments"] += delta_args
-                # 发送工具调用增量
-                tool_call_delta = {
-                    "tool_calls": [{
-                        "index": len(self.tool_calls),
-                        "function": {"arguments": delta_args}
-                    }]
-                }
-                chunks.append(create_chat_stream_chunk(
-                    self.chat_id, self.model,
-                    tool_call_delta
-                ))
+            tool_call = self._lookup_tool_call(event_data)
+            if tool_call is not None and isinstance(delta_args, str):
+                chunks.extend(self._emit_tool_arguments_delta(tool_call, delta_args))
+            elif delta_args:
+                logger.warning("Received function-call arguments before its output item: %s", event_data)
         
         elif event_type == "response.function_call_arguments.done":
-            # 函数调用完成
-            if self.current_tool_call:
-                self.tool_calls.append(self.current_tool_call)
-                self.current_tool_call = None
+            tool_call = self._lookup_tool_call(event_data)
+            if tool_call is not None:
+                chunks.extend(self._complete_tool_arguments(tool_call, event_data.get("arguments")))
         
         elif event_type == "response.output_item.done":
-            # 单个输出项完成
-            pass
+            # Some compatible gateways omit arguments.done and include the
+            # final arguments in the completed function_call item instead.
+            item = event_data.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                item_event = dict(event_data)
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    item_event["item_id"] = item_id
+                tool_call = self._lookup_tool_call(item_event)
+                if tool_call is not None:
+                    chunks.extend(self._complete_tool_arguments(tool_call, item.get("arguments")))
         
         elif event_type == "response.completed":
             # 响应完成
@@ -936,7 +1018,7 @@ class ResponseStreamProcessor:
         finish_chunk = create_chat_stream_chunk(
             self.chat_id, self.model,
             {},
-            finish_reason="stop",
+            finish_reason="tool_calls" if self.tool_calls else "stop",
             usage=chat_usage
         )
         chunks.append(finish_chunk)

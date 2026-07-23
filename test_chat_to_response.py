@@ -44,6 +44,12 @@ def parse_sse_events(payload: str):
     return events
 
 
+def parse_chat_stream_chunk(chunk: str):
+    """Read one Chat Completions SSE chunk emitted by ResponseStreamProcessor."""
+    data_line = next(line for line in chunk.splitlines() if line.startswith("data:"))
+    return json.loads(data_line[5:].strip())
+
+
 class ChatToResponseTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
@@ -376,6 +382,117 @@ class ChatToResponseTests(unittest.TestCase):
             self.assertEqual(function_call["call_id"], "call_stream")
             self.assertEqual(function_call["name"], "lookup")
             self.assertEqual(function_call["arguments"], '{"q":"ping"}')
+
+    def test_response_to_chat_stream_preserves_function_call_identity_and_finish_reason(self):
+        """Responses function metadata must precede Chat argument deltas."""
+        processor = main.ResponseStreamProcessor("chatcmpl_tools", "gpt-5.4", include_usage=False)
+        added_chunks = processor.process_event(
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_probe",
+                    "call_id": "call_probe",
+                    "name": "interface_probe",
+                    "arguments": "",
+                },
+            },
+        )
+
+        identity_delta = parse_chat_stream_chunk(added_chunks[0])
+        tool_delta = identity_delta["choices"][0]["delta"]["tool_calls"][0]
+        self.assertEqual(
+            tool_delta,
+            {
+                "index": 0,
+                "id": "call_probe",
+                "type": "function",
+                "function": {"name": "interface_probe", "arguments": ""},
+            },
+        )
+
+        arguments_chunks = []
+        for value in ('{"value":"', 'ok"}'):
+            arguments_chunks.extend(
+                processor.process_event(
+                    "response.function_call_arguments.delta",
+                    {"output_index": 0, "item_id": "fc_probe", "delta": value},
+                )
+            )
+        processor.process_event(
+            "response.function_call_arguments.done",
+            {"output_index": 0, "item_id": "fc_probe", "arguments": '{"value":"ok"}'},
+        )
+
+        self.assertEqual(
+            [
+                parse_chat_stream_chunk(chunk)["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                for chunk in arguments_chunks
+            ],
+            ['{"value":"', 'ok"}'],
+        )
+        accumulated = processor.get_accumulated_response()
+        self.assertEqual(accumulated["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(
+            accumulated["choices"][0]["message"]["tool_calls"][0],
+            {
+                "id": "call_probe",
+                "type": "function",
+                "function": {"name": "interface_probe", "arguments": '{"value":"ok"}'},
+            },
+        )
+
+        final_chunk = parse_chat_stream_chunk(processor.get_final_chunks()[0])
+        self.assertEqual(final_chunk["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_response_to_chat_stream_routes_parallel_function_arguments_by_item_id(self):
+        processor = main.ResponseStreamProcessor("chatcmpl_parallel", "gpt-5.4", include_usage=False)
+        for output_index, item_id, call_id, name in [
+            (0, "fc_first", "call_first", "first_tool"),
+            (1, "fc_second", "call_second", "second_tool"),
+        ]:
+            processor.process_event(
+                "response.output_item.added",
+                {
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "",
+                    },
+                },
+            )
+
+        # Deliberately interleave the two calls. A single current_tool_call
+        # would append both argument streams to the second call.
+        processor.process_event(
+            "response.function_call_arguments.delta",
+            {"output_index": 1, "item_id": "fc_second", "delta": '{"second":2}'},
+        )
+        processor.process_event(
+            "response.function_call_arguments.delta",
+            {"output_index": 0, "item_id": "fc_first", "delta": '{"first":1}'},
+        )
+
+        calls = processor.get_accumulated_response()["choices"][0]["message"]["tool_calls"]
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "id": "call_first",
+                    "type": "function",
+                    "function": {"name": "first_tool", "arguments": '{"first":1}'},
+                },
+                {
+                    "id": "call_second",
+                    "type": "function",
+                    "function": {"name": "second_tool", "arguments": '{"second":2}'},
+                },
+            ],
+        )
 
 
 if __name__ == "__main__":
